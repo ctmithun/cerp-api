@@ -1,23 +1,24 @@
 package faculty
 
 import (
-	"bytes"
 	"cerpApi/cfg_details"
-	"cerpApi/psw_generator"
+	"cerpApi/iam"
 	"context"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"github.com/oklog/ulid/v2"
-	"io"
-	"net/http"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"strings"
+	"sync"
 	"time"
 )
 
 var CFG, _ = config.LoadDefaultConfig(context.TODO(), config.WithRegion("ap-south-1"))
+
+// var CFG, _ = config.LoadDefaultConfig(context.TODO(), config.WithSharedConfigProfile("mumbai"), config.WithRegion("ap-south-1"))
 var DynamoCfg = dynamodb.NewFromConfig(CFG)
 
 var roleBody = map[string][]string{
@@ -33,86 +34,89 @@ type Faculty struct {
 	Doj         string `json:"doj"`
 	Subjects    string `json:"subjects"`
 	Description string `json:"description"`
+	Type        string `json:"type"`
 }
 
 type OnboardFacultyMetadata struct {
-	PK      string `dynamodbav:"key"`
-	SK      string `dynamodbav:"skey"`
-	Value   string `dynamodbav:"value"`
-	Ts      int64  `dynamodbav:"ts"`
-	Updater string `dynamodbav:"uBy"`
+	PK      string  `dynamodbav:"key"`
+	SK      string  `dynamodbav:"email"`
+	Value   Faculty `dynamodbav:"value"`
+	Ts      int64   `dynamodbav:"ts"`
+	Updater string  `dynamodbav:"uBy"`
 }
 
-func CreateFacultyMeta(college string, facultyData Faculty, userId string) (bool, string) {
-	uId := generateUserId(college)
-	user := createAuth0User(facultyData, uId, college)
+func CreateFacultyMeta(college string, facultyData Faculty, uBy string) (bool, string) {
+	uId := cfg_details.GenerateUserId(getFacultyIdKey(college, facultyData))
+	user := iam.CreateAuth0User(mapFacultyData(facultyData, uId, college))
+	fmt.Println("User created by the id - ", user)
 	if user == "" {
 		return false, uId
 	}
-	err := setUserRoles(uId)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var err error
+	go func() {
+		defer wg.Done()
+		iam.SetUserRoles(user, &err, marshalledRole)
+		fmt.Println("User roles updated")
+	}()
+	ok, err := updateFacultyData(college, facultyData, user, uBy)
+	if !ok {
+		return false, uId
+	}
+	fmt.Printf("Updated table and waiting for rolesSet...\n")
+	wg.Wait()
 	if err != nil {
 		return false, uId
 	}
-	PKKey := college + "_" + "faculty"
+	return true, uId
+}
+
+func updateFacultyData(college string, facultyData Faculty, user string, uBy string) (bool, error) {
+	PKKey := user
 	SKKey := facultyData.Email
-	val := make(map[string]string)
-	val["email"] = facultyData.Email
-	val["name"] = facultyData.Name
-	inputVal := map[string]string{
-		"id":   uId,
-		"name": facultyData.Name,
-	}
-	valByte, err := json.Marshal(inputVal)
-	if err != nil {
-		return false, uId
-	}
 	onF := OnboardFacultyMetadata{
 		PK:      PKKey,
 		SK:      SKKey,
-		Value:   string(valByte),
+		Value:   facultyData,
 		Ts:      time.Now().UTC().Unix(),
-		Updater: userId,
+		Updater: uBy,
 	}
+	facultyData.Id = PKKey
 	data, err := attributevalue.MarshalMap(onF)
-	_, err = DynamoCfg.PutItem(context.TODO(), &dynamodb.PutItemInput{
+	_, err = cfg_details.DynamoCfg.PutItem(context.TODO(), &dynamodb.PutItemInput{
 		TableName: aws.String(college + "_faculty"),
 		Item:      data,
 	})
-
 	if err != nil {
-		return false, uId
+		fmt.Println("Error putting faculty data - ", err)
+		return false, err
 	}
-	return true, ""
+	facultyBasicData := Faculty{
+		Name: facultyData.Name,
+	}
+	allFacultyData := OnboardFacultyMetadata{
+		PK:    college + "_faculty",
+		SK:    user,
+		Value: facultyBasicData,
+	}
+	allFacultyMarshalData, err := attributevalue.MarshalMap(allFacultyData)
+	if err != nil {
+		fmt.Println(err)
+		return false, err
+	}
+	_, err = cfg_details.DynamoCfg.PutItem(context.TODO(), &dynamodb.PutItemInput{
+		TableName: aws.String(college + "_faculty"),
+		Item:      allFacultyMarshalData,
+	})
+	if err != nil {
+		fmt.Printf("Updating table failed...\n")
+		return false, err
+	}
+	return true, nil
 }
 
-func setUserRoles(uId string) error {
-	url := cfg_details.API_URL + "/users/" + uId + "/roles"
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(marshalledRole))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+cfg_details.TOKEN)
-	if err != nil {
-		return err
-	}
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	resBody, err := io.ReadAll(res.Body)
-	respMap := make(map[string]interface{})
-	err = json.Unmarshal(resBody, &respMap)
-	if val, ok := respMap["statusCode"]; err != nil || (ok && val.(int) > 300) {
-		return errors.New("Roles setting failed, Try after sometime")
-	}
-	return nil
-}
-
-func generateUserId(col string) string {
-	ulId := ulid.Make()
-	return ulId.String()
-}
-
-func createAuth0User(data Faculty, uId string, college string) string {
+func mapFacultyData(data Faculty, uId string, college string) map[string]interface{} {
 	body := map[string]interface{}{
 		"email":          data.Email,
 		"phone_number":   "+91" + data.PhoneNumber,
@@ -123,61 +127,135 @@ func createAuth0User(data Faculty, uId string, college string) string {
 		"nickname":       data.Name,
 		"user_id":        college + "|" + uId,
 		"connection":     "Username-Password-Authentication",
-		"password":       generateRandomPsw(),
 		"verify_email":   true,
 	}
-	url := cfg_details.API_URL + "/users"
-	marshalled, err := json.Marshal(body)
-	if err != nil {
-		return ""
-	}
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(marshalled))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+cfg_details.TOKEN)
-	if err != nil {
-		return ""
-	}
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return ""
-	}
-	resBody, err := io.ReadAll(res.Body)
-	respMap := make(map[string]interface{})
-	err = json.Unmarshal(resBody, &respMap)
-	if val, ok := respMap["statusCode"]; err != nil || (ok && val.(int) > 300) {
-		return ""
-	}
-	return respMap["user_id"].(string)
+	return body
 }
 
-func generateRandomPsw() string {
-	return psw_generator.GeneratePsw()
+func GetFacultyAssignedSubjects(colId string, userId string) string {
+	data, err := cfg_details.DynamoCfg.Query(context.TODO(), &dynamodb.QueryInput{
+		TableName: aws.String(colId + "_faculty"),
+		Limit:     aws.Int32(1),
+		ExpressionAttributeNames: map[string]string{
+			"#pk": "key",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":hashKey": &types.AttributeValueMemberS{Value: userId},
+		},
+		KeyConditionExpression: aws.String("#pk = :hashKey"),
+		ScanIndexForward:       aws.Bool(false),
+	})
+	if err != nil {
+		fmt.Println("Error in fetching data - ", err)
+		return ""
+	}
+	items := data.Items
+	if len(items) == 0 {
+		fmt.Println("No data found - ", userId)
+		return ""
+	}
+	item := items[0]["value"]
+	var res map[string]string
+	_ = attributevalue.Unmarshal(item, &res)
+	return fmt.Sprintf("%s", res["subjects"])
 }
 
-//func GetFaculties(college string) ([]faculty, error) {
-//	return []faculty{}, nil
-//key, err := attributevalue.Marshal(college)
-//if err != nil {
-//	return nil, err
-//}
-//ck := map[string]types.AttributeValue{
-//	"key":  key,
-//	"skey": sKey,
-//}
-//out, err := DynamoCfg.GetItem(context.Background(), &dynamodb.GetItemInput{
-//	TableName: aws.String("college_metadata"),
-//	Key:       ck,
-//})
-//fmt.Println(out)
-//item := out.Item["students"]
-//if item == nil {
-//	return nil, nil
-//}
-//fmt.Println(item)
-//var res string
-//err = attributevalue.Unmarshal(item, &res)
-//var parsedRes []student
-//err = json.Unmarshal([]byte(res), &parsedRes)
-//return parsedRes, err
-//}
+func GetFacultiesData(college string, facultyId string) string {
+	keyConditions := aws.String("#pk = :hashKey")
+	expressionAttributeValues := map[string]types.AttributeValue{
+		":hashKey": &types.AttributeValueMemberS{Value: college + "_faculty"},
+	}
+	expressionAttributeNames := map[string]string{
+		"#pk":  "key",
+		"#val": "value",
+	}
+	if facultyId != "" {
+		keyConditions = aws.String("#pk = :hashKey")
+		expressionAttributeValues[":hashKey"] = &types.AttributeValueMemberS{Value: facultyId}
+	}
+	cols := aws.String("email,#val")
+	data, err := cfg_details.DynamoCfg.Query(context.TODO(), &dynamodb.QueryInput{
+		TableName:                 aws.String(college + "_faculty"),
+		Limit:                     aws.Int32(50),
+		KeyConditionExpression:    keyConditions,
+		ProjectionExpression:      cols,
+		ExpressionAttributeNames:  expressionAttributeNames,
+		ExpressionAttributeValues: expressionAttributeValues,
+		ScanIndexForward:          aws.Bool(false),
+	})
+	if err != nil {
+		fmt.Println(err)
+	}
+	res := make([]Faculty, len(data.Items))
+	for i := 0; i < len(data.Items); i++ {
+		var item Faculty
+		err = attributevalue.Unmarshal(data.Items[i]["value"], &item)
+		if facultyId != "" {
+			err = attributevalue.Unmarshal(data.Items[i]["email"], &item.Email)
+			item.Id = facultyId
+		} else {
+			err = attributevalue.Unmarshal(data.Items[i]["email"], &item.Id)
+		}
+
+		if err == nil {
+			res[i] = item
+		}
+	}
+	finalRes, err := json.Marshal(res)
+	if err != nil {
+		return ""
+	}
+	return string(finalRes)
+}
+
+func ModifyFacultyData(college string, facultyForm Faculty, uBy string) (bool, string) {
+	user := cfg_details.GenerateUserId(getFacultyIdKey(college, facultyForm))
+	if !strings.Contains(facultyForm.Id, user) {
+		return false, cfg_details.INVALID_DATA
+	}
+	_, err := updateFacultyData(college, facultyForm, facultyForm.Id, uBy)
+	if err != nil {
+		fmt.Println("Failed updating on the user - ", user)
+		return false, facultyForm.Email
+	}
+	return true, facultyForm.Email
+}
+
+func DeactivateFaculty(college string, facultyForm Faculty, uBy string) (bool, string) {
+	user := cfg_details.GenerateUserId(getFacultyIdKey(college, facultyForm))
+	if !strings.Contains(facultyForm.Id, user) {
+		return false, cfg_details.INVALID_DATA
+	}
+	err := iam.DeactivateUser(facultyForm.Id, uBy)
+	if err != nil {
+		return false, err.Error()
+	}
+	item, err := cfg_details.DynamoCfg.DeleteItem(context.TODO(), &dynamodb.DeleteItemInput{
+		TableName: aws.String(college + "_faculty"),
+		Key: map[string]types.AttributeValue{
+			"key":   &types.AttributeValueMemberS{Value: facultyForm.Id},
+			"email": &types.AttributeValueMemberS{Value: facultyForm.Email},
+		},
+	})
+	if err != nil || item == nil {
+		fmt.Println("Error in deactivating faculty from the table - ", facultyForm.Id)
+		return false, ""
+	}
+	item, err = cfg_details.DynamoCfg.DeleteItem(context.TODO(), &dynamodb.DeleteItemInput{
+		TableName: aws.String(college + "_faculty"),
+		Key: map[string]types.AttributeValue{
+			"key":   &types.AttributeValueMemberS{Value: college + "_faculty"},
+			"email": &types.AttributeValueMemberS{Value: facultyForm.Id},
+		},
+	})
+	if err != nil || item == nil {
+		fmt.Printf("Error in deactivating faculty from the table for %s_faculty partition key - %s\n", college, facultyForm.Id)
+		return false, ""
+	}
+	return true, ""
+
+}
+
+func getFacultyIdKey(college string, facultyForm Faculty) string {
+	return "F-" + college + "|" + facultyForm.Email + "_" + facultyForm.PhoneNumber
+}
