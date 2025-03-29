@@ -19,12 +19,6 @@ import (
 var CFG, _ = config.LoadDefaultConfig(context.TODO(), config.WithRegion("ap-south-1"))
 
 // var CFG, _ = config.LoadDefaultConfig(context.TODO(), config.WithSharedConfigProfile("mumbai"), config.WithRegion("ap-south-1"))
-var DynamoCfg = dynamodb.NewFromConfig(CFG)
-
-var roleBody = map[string][]string{
-	"roles": {cfg_details.FACULTY_ROLE},
-}
-var marshalledRole, _ = json.Marshal(roleBody)
 
 type Faculty struct {
 	Email       string `json:"email"`
@@ -35,6 +29,8 @@ type Faculty struct {
 	Subjects    string `json:"subjects"`
 	Description string `json:"description"`
 	Type        string `json:"type"`
+	Roles       string `json:"roles"`
+	Designation string `json:"designation"`
 }
 
 type OnboardFacultyMetadata struct {
@@ -52,12 +48,18 @@ func CreateFacultyMeta(college string, facultyData Faculty, uBy string) (bool, s
 	if user == "" {
 		return false, uId
 	}
+	roles := strings.Split(facultyData.Roles, ",")
 	var wg sync.WaitGroup
 	wg.Add(1)
 	var err error
 	go func() {
 		defer wg.Done()
-		iam.SetUserRoles(user, &err, marshalledRole)
+		marshaledRoleTmp, err := json.Marshal(getRoles(roles))
+		if err != nil {
+			fmt.Printf("Error Marshaling the allRoles - %v", err)
+			return
+		}
+		iam.SetUserRoles(user, &err, marshaledRoleTmp)
 		fmt.Println("User roles updated")
 	}()
 	ok, err := updateFacultyData(college, facultyData, user, uBy)
@@ -72,6 +74,22 @@ func CreateFacultyMeta(college string, facultyData Faculty, uBy string) (bool, s
 	return true, uId
 }
 
+func getRoles(roles []string) map[string][]string {
+	allRoles := make(map[string][]string)
+	allRoles["roles"] = make([]string, 0)
+	for _, role := range roles {
+		switch role {
+		case "faculty":
+			allRoles["roles"] = append(allRoles["roles"], cfg_details.FACULTY_ROLE)
+		case "counselor":
+			allRoles["roles"] = append(allRoles["roles"], cfg_details.COUNSELOR_ROLE)
+		case "admin":
+			allRoles["roles"] = append(allRoles["roles"], cfg_details.ADMIN_ROLE)
+		}
+	}
+	return allRoles
+}
+
 func updateFacultyData(college string, facultyData Faculty, user string, uBy string) (bool, error) {
 	PKKey := user
 	SKKey := facultyData.Email
@@ -79,7 +97,7 @@ func updateFacultyData(college string, facultyData Faculty, user string, uBy str
 		PK:      PKKey,
 		SK:      SKKey,
 		Value:   facultyData,
-		Ts:      time.Now().UTC().Unix(),
+		Ts:      time.Now().Unix(),
 		Updater: uBy,
 	}
 	facultyData.Id = PKKey
@@ -157,7 +175,7 @@ func GetFacultyAssignedSubjects(colId string, userId string) string {
 	item := items[0]["value"]
 	var res map[string]string
 	_ = attributevalue.Unmarshal(item, &res)
-	return fmt.Sprintf("%s", res["subjects"])
+	return fmt.Sprintf("%s", res["Subjects"])
 }
 
 func GetFacultiesData(college string, facultyId string) string {
@@ -208,12 +226,20 @@ func GetFacultiesData(college string, facultyId string) string {
 	return string(finalRes)
 }
 
-func ModifyFacultyData(college string, facultyForm Faculty, uBy string) (bool, string) {
+func ModifyFacultyData(college string, facultyForm Faculty, uBy string, isRoleUpdate bool) (bool, string) {
 	user := cfg_details.GenerateUserId(getFacultyIdKey(college, facultyForm))
 	if !strings.Contains(facultyForm.Id, user) {
 		return false, cfg_details.INVALID_DATA
 	}
 	_, err := updateFacultyData(college, facultyForm, facultyForm.Id, uBy)
+	if isRoleUpdate {
+		marshaledRoleTmp, err := json.Marshal(getRoles(strings.Split(facultyForm.Roles, ",")))
+		if err != nil {
+			fmt.Printf("Error Marshaling the allRoles - %v", err)
+			return false, cfg_details.CODE_ERROR + err.Error()
+		}
+		iam.SetUserRoles(facultyForm.Id, &err, marshaledRoleTmp)
+	}
 	if err != nil {
 		fmt.Println("Failed updating on the user - ", user)
 		return false, facultyForm.Email
@@ -221,12 +247,26 @@ func ModifyFacultyData(college string, facultyForm Faculty, uBy string) (bool, s
 	return true, facultyForm.Email
 }
 
+//func UploadFacultyFiles()
+
 func DeactivateFaculty(college string, facultyForm Faculty, uBy string) (bool, string) {
 	user := cfg_details.GenerateUserId(getFacultyIdKey(college, facultyForm))
 	if !strings.Contains(facultyForm.Id, user) {
 		return false, cfg_details.INVALID_DATA
 	}
-	err := iam.DeactivateUser(facultyForm.Id, uBy)
+	err := iam.DeleteUser(facultyForm.Id, uBy)
+	if err != nil {
+		return false, err.Error()
+	}
+	return true, ""
+}
+
+func DeleteFaculty(college string, facultyForm Faculty, uBy string) (bool, string) {
+	user := cfg_details.GenerateUserId(getFacultyIdKey(college, facultyForm))
+	if !strings.Contains(facultyForm.Id, user) {
+		return false, cfg_details.INVALID_DATA
+	}
+	err := iam.DeleteUser(facultyForm.Id, uBy)
 	if err != nil {
 		return false, err.Error()
 	}

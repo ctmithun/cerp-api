@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
+	"cerpApi/attendance"
 	"cerpApi/cfg_details"
+	"cerpApi/enquiry"
 	"cerpApi/faculty"
 	jwtVerifier "cerpApi/jwt"
+	"cerpApi/onboard_data"
 	"cerpApi/students"
 	"context"
 	"crypto/hmac"
@@ -19,13 +23,21 @@ import (
 	_ "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/golang-jwt/jwt/v4"
+	"github.com/grokify/go-awslambda"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"io"
+	"log"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -36,8 +48,7 @@ import (
 
 var SECRET = []byte("This is the way -- Mando")
 
-//var CFG, _ = config.LoadDefaultConfig(context.TODO(), config.WithSharedConfigProfile("mumbai"), config.WithRegion("ap-south-1"))
-
+// var CFG, _ = config.LoadDefaultConfig(context.TODO(), config.WithSharedConfigProfile("mumbai"), config.WithRegion("ap-south-1"))
 var CFG, _ = config.LoadDefaultConfig(context.TODO(), config.WithRegion("ap-south-1"))
 var DYNAMO_CFG = dynamodb.NewFromConfig(CFG)
 var ResponseHeaders = map[string]string{"Access-Control-Allow-Origin": "*", "X-Frame-Options": "SAMEORIGIN", "Strict-Transport-Security": "max-age=31557600; includeSubDomains"}
@@ -47,119 +58,74 @@ var AUTH_404 = getProxyResponse("Service Not Found!", 404)
 var AUTH_403 = getProxyResponse("Access Denied!", 403)
 var AUTH_400 = getProxyResponse("Invalid fId!", 400)
 
+const (
+	ROLE_ADMIN      = "admin"
+	ROLE_COUNSELLOR = "counsellor"
+)
+
+type postgres struct {
+	db *pgxpool.Pool
+}
+
+var (
+	pgInstance *postgres
+	pgOnce     sync.Once
+	s3Client   *s3.Client
+	uploader   *manager.Uploader
+)
+
+func NewPG(ctx context.Context, connString string) (*postgres, error) {
+	pgOnce.Do(func() {
+		db, err := pgxpool.New(ctx, connString)
+		if err != nil {
+			err = fmt.Errorf("unable to create connection pool: %w", err)
+			return
+		}
+
+		pgInstance = &postgres{db}
+	})
+
+	return pgInstance, nil
+}
+
+func (pg *postgres) Ping(ctx context.Context) error {
+	return pg.db.Ping(ctx)
+}
+
+func (pg *postgres) Close() {
+	pg.db.Close()
+}
+
 func getProxyResponse(body string, statusCode int) events.APIGatewayProxyResponse {
 	return events.APIGatewayProxyResponse{Body: body, StatusCode: statusCode, IsBase64Encoded: true, Headers: ResponseHeaders}
 }
 
 func main() {
+	_, err := NewPG(context.Background(), "postgresql://cerp:7pFJwJHKWvWwIRycQ9yXew@weary-flapper-8111.j77.aws-ap-south-1.cockroachlabs.cloud:26257/cerp?sslmode=verify-full")
+	if err != nil {
+		log.Fatal(err)
+		return
+	}
+	defer log.Println("In main method after handler and after DB close stack call")
+	defer pgInstance.Close()
 
-	//ch := make(chan bool)
-	//
-	//go func() {
-	//	// Do some work
-	//	ch <- false
-	//}()
-	//
-	//// Wait for the goroutine to finish
-	//res := <-ch
-	//print(res)
+	s3Client = s3.NewFromConfig(CFG)
+	uploader = manager.NewUploader(s3Client)
 
-	//log.Println("Running lambda-authorizer")
+	//fileName := "signature.jpg" // Change this to the file you want to upload
+	//file, err := os.Open(fileName)
+	//if err != nil {
+	//	log.Fatalf("Failed to open file: %v", err)
+	//}
+	//defer file.Close()
+
+	// Upload the fil
 	lambda.Start(handler)
-	//fmt.Println(faculty.GetFacultyAssignedSubjects("ni", "auth0|ni|93aec99611a99b76eb82124157566651"))
-	//dsa := students.GetRowNumber("2025-BCA", "ni")
-	//fmt.Println(dsa)
 
-	//student := students.Student{
-	//	Email:       "kkumar@email.com",
-	//	Id:          "auth0|ni|54addb248438a25ab5fec6b4c673f06b",
-	//	Name:        "Kiran Ram Kumar M",
-	//	PhoneNumber: "9875673214",
-	//	Doj:         "2025-01-15",
-	//	Sid:         "2025-BCOM-1",
-	//	Batch:       "2025",
-	//	Stream:      "BCOM",
-	//	Fees:        120000,
-	//}
-	//students.DeactivateStudent("ni", student, "test-user")
-	//students.OnboardStudent("ni", &student, "test-user")
-	//students.UpdateStudentRecord("ni", &student, "test-user")
-	//students.GetStudentsData("ni", "2025", "BCA")
-	//fmt.Println("Created Student - ", sId)
-	//claims, _ := jwtVerifier.VerifyToken("Bearer eyJraWQiOiJQTExXaEpyUVFuSEZTQWcwWWhkSE5FcXJTZzVWVUhqVEdCd2M0V3YzcElvPSIsImFsZyI6IlJTMjU2In0.eyJzdWIiOiI5MDBiZWY3Mi1iNmM4LTQxOWQtYjhhMS02YTc4YmVhMzJiYTMiLCJpc3MiOiJodHRwczpcL1wvY29nbml0by1pZHAuZXUtd2VzdC0xLmFtYXpvbmF3cy5jb21cL2V1LXdlc3QtMV9aaFdIOFk1WU8iLCJ2ZXJzaW9uIjoyLCJjbGllbnRfaWQiOiIybmUzcXZiaWRtMzlnaWhlYzBvZmExczY5NyIsImV2ZW50X2lkIjoiY2YxNjM4OTctZjMyYi00MTNiLWFmYzEtNTI1OGU3NTVmODY1IiwidG9rZW5fdXNlIjoiYWNjZXNzIiwic2NvcGUiOiJhd3MuY29nbml0by5zaWduaW4udXNlci5hZG1pbiBwaG9uZSBvcGVuaWQgcHJvZmlsZSBlbWFpbCIsImF1dGhfdGltZSI6MTczNjIyNjU0NywiZXhwIjoxNzM2MjMwMTQ3LCJpYXQiOjE3MzYyMjY1NDcsImp0aSI6IjQ3YjgwNDcwLWRjYzktNDNlYy1hYzJkLTk1Yzc0YmI5YTU5MSIsInVzZXJuYW1lIjoiOTAwYmVmNzItYjZjOC00MTlkLWI4YTEtNmE3OGJlYTMyYmEzIn0.bD8Ksxw7isJWRbgzbhhioxicxXoCaAUVCCcOWYLpgmtrkMEi8efqkGm4C6o-aDQXLfeeQYXOtiIkdzIHqAW6MyfxxPNva6X7mncDyVywp6-7Mq964VOf8pn4tcUs6c29Rqv72rS7eM4kd2TCqdlJa_qyLFDs3oRZoCQ_zr1fbQvLDohIht4I-79dGz5-xvSsXE85BpyVo6cuz4COLy8Noir_bhZiVpvAxpiCH1b1vwKOeYL-zDgnz2xRp6IzjlVP0r8HdTkonvw5yUd63B468nN3uh8L77jfvgKrC4_XMuLBIcGpgIT_HV39c3PP0JcgLR1IC8zUhjZ9_fxsiyCeUg")
-	//res := extractRoles(claims)
-	//fmt.Println(res)
-	//data := []byte("ni" + "|" + "ctiitm@rediffmail.com")
-	//hash := md5.Sum(data)
-	//uId := hex.EncodeToString(hash[:])
-	//fmt.Println(uId)
-
-	//req := events.APIGatewayProxyRequest{
-	//	Headers: map[string]string{},
-	//}
-	//req.Headers["Authorization"] = "Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IlNwb3ZQcXFBUFVKbWljZjdMRFkxViJ9.eyJpc3MiOiJodHRwczovL2Rldi1xMHl3djFhdjFtZG84ejRuLnVzLmF1dGgwLmNvbS8iLCJzdWIiOiJhdXRoMHw2NzA2OTIyMDk1NGUxYmQ0NTFkMjJiZmMiLCJhdWQiOlsiaHR0cHM6Ly9kZXYtcTB5d3YxYXYxbWRvOHo0bi51cy5hdXRoMC5jb20vYXBpL3YyLyIsImh0dHBzOi8vZGV2LXEweXd2MWF2MW1kbzh6NG4udXMuYXV0aDAuY29tL3VzZXJpbmZvIl0sImlhdCI6MTcyOTUwNTA1NywiZXhwIjoxNzI5NTA2ODU3LCJzY29wZSI6Im9wZW5pZCBwcm9maWxlIGVtYWlsIiwiYXpwIjoidDRwVnc0c1B2RldndnE0bjNEZ3ZGR25hdk1hdHFZd3YifQ.ckL7dyxUqfFEuc83eauc4K3JtjD50UWWWAuq1m-zcSaYaSHfTP-YgTx_WgrG19rr_pWPlS0YIGrRhEvTsvTcmSg7qtsPx66EAIJnazfPa8vUsBqXFBPH5YW7RC-nyVChcxvhf5XwiUK_lr32l4LNVz8DS-v5t4ERUF71Maa6yefaTMdXGvXGD1K2zdhUwMBLNP-r3xudu_BmMX8xBoNwJHBHDqCVWAYVNffY0XEGmC0m3Wb5w8nf4ANxatUSA99Ta_al-W5yrwIbWIql9Rn-hNeAj_0-ZmY3Bj2ZCVnZgaMotdGezhSOlCNJcfPIyLxF3ReeV38IhcSAS19UnRJi5g"
-	//_, err := handler(req)
 	//if err != nil {
-	//	panic(err)
+	//	log.Fatalf("Failed to load AWS config: %v", err)
 	//}
 
-	//lambda.Start(handler)
-	//students, err := getStudents("ni", "BCA", "SEM-1")
-	//attendanceStudents, err := getAttendanceStudents("ni", "BCA", "SEM-1", "CA-C1T", "31-10-2024")
-	//if err != nil {
-	//	return
-	//}
-	//if err != nil {
-	//	return
-	//}
-	//fmt.Println(attendanceStudents)
-
-	//form, err := getAttendanceForm("ni", "BCA", "SEM-1", "CA-C1T", "30-10-2024")
-	//if err != nil {
-	//	return
-	//}
-	//fmt.Println(form)
-
-	//err := updateAttendanceForm("ni", "BCA", "SEM-1", "CA-C1T", "2024-10-28", 23213)
-	//if err != nil {
-	//	return
-	//}
-	//OnboardSubjects("ni", "BCA", "SEM-1", "mithun", nil)
-
-	//getStudents("ni", "BCA", "SEM-2")
-
-	//data := faculty.Faculty{
-	//	Email:       "tcta@cta.com",
-	//	Id:          "auth0|ni|6eff353c8aa24efffb5d6dafa139296a",
-	//	Name:        "Thippeswamy M",
-	//	PhoneNumber: "9877880216",
-	//	Doj:         "2025-01-01",
-	//	Subjects:    "MBA_SEM-1_E21CT,MBA_SEM-1_E22CT",
-	//	Description: "New adjunct faculty",
-	//	Type:        "Full-Time",
-	//}
-	//faculty.DeactivateFaculty("ni", data, "test-user")
-	//faculty.ModifyFacultyData("ni", data, "test-user")
-	//var wg sync.WaitGroup
-	//wg.Add(1)
-	//var err error
-	//faculty.SetUserRoles("auth0|ni|01JGVFGJXEYWBFNCTM7V0DMV22", &wg, &err)
-	//wg.Wait()
-	//token := parseHmacToken("MTczNjY4MTg5Ny5hZG1pbixmYWN1bHR5LmF1dGgwfDY3MjVlM2QwMDkyNDNkYjVhYzE0NGNkYy5jMzhkMGJjZDJlODBmZDkwNjA2YmM3Zjk0OTVkNzdlZTlmYmUwNjVhNGQwNGZlNTQxODk1YjY5M2I0YmNiYjA1")
-	//fmt.Println(token)
-	//fac := faculty.Faculty{
-	//	Email:       "ctiitm2@rediffmail.com",
-	//	Id:          "auth0|ni|01JGVJVTN917CXPRA8TKMHB0M2",
-	//	Name:        "Manjula C P",
-	//	PhoneNumber: "9743213022",
-	//	Doj:         "2025-01-02",
-	//	Subjects:    "BCA_SEM-1_CA-C3T,BCA_SEM-1_CA-C2T",
-	//	Description: "",
-	//}
-	//faculty.CreateFacultyMeta("ni", fac, "test-user")
-	//fId, _ := url.PathUnescape("auth0%7Cni%7Cc99b893c21d24e4b48e8a7e7c22f7d76")
-	//faculty.GetFacultiesData("ni", fId)
-	//students.GetStudentsData("ni", "2025", "BCA")
 }
 
 func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
@@ -168,40 +134,66 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 		return AUTH_500, err
 	}
 	userId := claims["sub"].(string)
-	//resPath := request.Resource
-	fmt.Printf("Resource path requested is %s", claims)
+	fmt.Printf("Resource is %s\n", request.Resource)
+	//fmt.Printf("Resource path requested is %s\n", claims)
+	//fmt.Printf("Resource Headers requested are %s\n", request.Headers)
 	if request.Resource == "/roles" {
 		res := extractRoles(claims)
 		if res == "" {
 			return AUTH_403, errors.New("no roles set")
 		}
 		tkn := getHmacData(int64(int(claims["exp"].(float64))), res, userId)
-		return respondData(claims, tkn, err)
+		log.Printf("Encoded Token is %s\n", tkn)
+		return respondData(tkn, err)
 	} else if request.Resource == "/userRoles" {
 		res := fetchRoles(strings.Split(userId, "|")[1])
 		if res == "" {
 			return AUTH_500, errors.New("no roles set")
 		}
-		return respondData(claims, res, err)
+		return respondData(res, err)
 	}
 	roles := parseHmacToken(request.Headers["cerp-api-token"])
 	if roles == "" {
 		return AUTH_403, errors.New("Invalid Token!!")
 	}
 	fmt.Printf("Found roles %s\n", roles)
-	if request.Resource == "/attendance/students" {
+	if request.Resource == "/admission/admit" && request.HTTPMethod == http.MethodPost {
+		if strings.Contains(roles, ROLE_COUNSELLOR) || strings.Contains(roles, ROLE_ADMIN) {
+			sId, err := handleAdmission(request, userId)
+			if err != nil {
+				return respondError(err.Error())
+			}
+			return respondData(sId, err)
+		}
+		return AUTH_403, errors.New("No roles set")
+
+	} else if request.Resource == "/attendance/students" {
 		if strings.Contains(roles, "faculty") || strings.Contains(roles, "admin") {
 			colId := request.QueryStringParameters["college_id"]
 			course := request.QueryStringParameters["class"]
 			batch := request.QueryStringParameters["batch"]
 			subject := request.QueryStringParameters["subject"]
 			date := request.QueryStringParameters["date"]
-			fmt.Println(colId, course, batch, subject, date)
-			res, err := getAttendanceStudents(colId, course, batch, subject, date)
+			cs := request.QueryStringParameters["class_section"]
+			res, err := getAttendanceStudents(colId, course, batch, subject, date, cs)
 			if err != nil {
 				return AUTH_500, err
 			}
-			return respondData(claims, res, err)
+			return respondData(res, err)
+		}
+		return AUTH_500, errors.New("no roles set")
+	} else if request.Resource == "/attendance/export" && request.HTTPMethod == http.MethodGet {
+		if strings.Contains(roles, "faculty") || strings.Contains(roles, "admin") {
+			colId := request.QueryStringParameters["college_id"]
+			course := request.QueryStringParameters["class"]
+			batch := request.QueryStringParameters["batch"]
+			subject := request.QueryStringParameters["subject"]
+			cs := request.QueryStringParameters["class_section"]
+			res := attendance.GetAttendanceReport(colId, course, batch, subject, cs)
+			if res == "" {
+				return respondData("Attendance Export Data Unavailable!", nil)
+			}
+			return respondData(res, nil)
 		}
 		return AUTH_500, errors.New("no roles set")
 	} else if request.Resource == "/subject" {
@@ -209,7 +201,7 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 		if strings.Contains(roles, "faculty") || strings.Contains(roles, "admin") {
 			fmt.Println("Getting the subjects ...")
 			res := getSubjects(request.QueryStringParameters["college_id"], request.QueryStringParameters["class"], request.QueryStringParameters["batch"])
-			return respondData(claims, res, err)
+			return respondData(res, err)
 		}
 		return AUTH_500, errors.New("no roles set")
 	} else if request.Resource == "/attendance/update" {
@@ -220,27 +212,51 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 			batch := request.QueryStringParameters["batch"]
 			subject := request.QueryStringParameters["subject"]
 			date := request.QueryStringParameters["date"]
-			var attendanceForm attendanceForm
+			cs := request.QueryStringParameters["class_section"]
+			val, exist := request.QueryStringParameters["send_absent_notification"]
+			sn := false
+			if exist {
+				sn, err = strconv.ParseBool(val)
+				if err != nil {
+					return respondError("Invalid input to send_notification query parameter")
+				}
+			}
+			if err != nil {
+				log.Printf("Error parsing send_absent_notification %v\n", err)
+				return AUTH_500, err
+			}
+			var attendanceForm attendance.AttendanceForm
 			err = json.Unmarshal([]byte(request.Body), &attendanceForm)
 			fmt.Println(attendanceForm)
 			attendanceForm.UBy = userId
 			attendanceForm.Ts = time.Now().UTC().Unix()
 			if err != nil {
-				return events.APIGatewayProxyResponse{}, err
+				return respondError(err.Error())
 			}
-			err = updateAttendanceForm(colId, course, batch, subject, date, &attendanceForm)
+			studentsSet := make([]attendance.Student, 0)
+			if sn {
+				studentsSet, err = getStudents(colId, course, batch, cs)
+				if err != nil {
+					log.Printf("Error getting students while updating the attendance %v\n", err)
+					return respondError(err.Error())
+				}
+			}
+			err = attendance.UpdateAttendance(colId, course, batch, subject, date, cs, sn, &attendanceForm, studentsSet)
 			if err != nil {
 				return AUTH_500, err
 			}
-			return respondData(claims, "Updated at - "+strconv.FormatInt(attendanceForm.Ts, 10), err)
+			return respondData("Updated at - "+strconv.FormatInt(attendanceForm.Ts, 10), err)
 		}
 		return AUTH_500, errors.New("no roles set")
 	} else if request.Resource == "/metadata/faculty/subjects" {
 		if strings.Contains(roles, "faculty") || strings.Contains(roles, "admin") {
 			colId := request.QueryStringParameters["college_id"]
 			data := faculty.GetFacultyAssignedSubjects(colId, userId)
-			return respondData(claims, data, err)
+			return respondData(data, err)
 		}
+	} else if strings.Contains(request.Resource, "/enq/") && (strings.Contains(roles, ROLE_COUNSELLOR) || strings.Contains(roles, ROLE_ADMIN)) {
+		userName := claims[cfg_details.ALLOWED_URL+"name"].(string)
+		return handleEnquiry(roles, request, userId, ctx, userName)
 	} else if strings.Contains(roles, "admin") {
 		if request.Resource == "/metadata/update" {
 			fmt.Printf("Inside the /metadata/update")
@@ -253,46 +269,53 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 				if err != nil {
 					return AUTH_500, err
 				}
-				return respondData(claims, "Updated at - "+strconv.FormatInt(ts, 10), err)
+				return respondData("Updated at - "+strconv.FormatInt(ts, 10), err)
 			} else if _type == "students" {
-				err, ts := onboardStudentsAttendance(colId, course, batch, userId, request.Body)
+				cs := request.QueryStringParameters["class_section"]
+				err, ts := onboardStudentsAttendance(colId, course, batch, userId, cs, request.Body)
 				if err != nil {
 					return AUTH_500, err
 				}
-				return respondData(claims, "Updated at - "+strconv.FormatInt(ts, 10), err)
+				return respondData("Updated at - "+strconv.FormatInt(ts, 10), err)
+			} else if _type == "s2s" {
+				cs := request.QueryStringParameters["class_section"]
+				res, err := onboard_data.OnboardS2S(colId, course, batch, cs, userId, []byte(request.Body))
+				if err != nil {
+					return respondError("Update Failed - " + err.Error())
+				}
+				return respondData("Updated at - "+res, err)
 			}
 		} else if request.Resource == "/metadata/getStudents" {
 			colId := request.QueryStringParameters["college_id"]
 			course := strings.ToLower(request.QueryStringParameters["class"])
 			batch := request.QueryStringParameters["batch"]
-			students, err := getStudents(colId, course, batch)
+			cs := request.QueryStringParameters["class_section"]
+			students, err := getStudents(colId, course, batch, cs)
 			if err != nil {
 				return AUTH_500, err
 			}
 			if students == nil {
-				return respondData(claims, "", nil)
+				return respondData("", nil)
 			}
 			fmt.Println(students)
 			res, err := json.Marshal(students)
 			if err != nil {
 				return AUTH_500, err
 			}
-			return respondData(claims, string(res), err)
-		} else if request.Resource == "/metadata/faculties" {
-			//colId := request.QueryStringParameters["college_id"]
-			//students, err := faculty.GetFaculties(colId)
-			//if err != nil {
-			//	return AUTH_500, err
-			//}
-			//if students == nil {
-			//	return respondData(claims, "", nil)
-			//}
-			//fmt.Println(students)
-			//res, err := json.Marshal(students)
-			//if err != nil {
-			//	return AUTH_500, err
-			//}
-			//return respondData(claims, string(res), err)
+			return respondData(string(res), err)
+		} else if request.Resource == "/metadata/s2s" && request.HTTPMethod == http.MethodGet {
+			colId := request.QueryStringParameters["college_id"]
+			course := strings.ToLower(request.QueryStringParameters["class"])
+			batch := request.QueryStringParameters["batch"]
+			cs := request.QueryStringParameters["class_section"]
+			if err != nil {
+				return respondError(err.Error())
+			}
+			res, err := onboard_data.GetS2S(colId, course, batch, cs)
+			if err != nil {
+				return respondError(err.Error())
+			}
+			return respondData(res, err)
 		} else if request.HTTPMethod == http.MethodPost && request.Resource == "/metadata/faculty/create" {
 			colId := request.QueryStringParameters["college_id"]
 			var facultyCreateForm faculty.Faculty
@@ -304,27 +327,40 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 			if !isCreated {
 				return AUTH_504, err
 			}
-			return respondData(claims, string(id), err)
+			return respondData(string(id), err)
 		} else if request.HTTPMethod == http.MethodPost && request.Resource == "/metadata/faculty/update" {
 			colId := request.QueryStringParameters["college_id"]
+			isRoleUpdate, _ := strconv.ParseBool(request.QueryStringParameters["lore"])
 			var facultyCreateForm faculty.Faculty
 			err = json.Unmarshal([]byte(request.Body), &facultyCreateForm)
 			if err != nil {
 				return AUTH_504, err
 			}
-			isUpdated, res := faculty.ModifyFacultyData(colId, facultyCreateForm, userId)
+			isUpdated, res := faculty.ModifyFacultyData(colId, facultyCreateForm, userId, isRoleUpdate)
 			if !isUpdated {
 				return respondError(res)
 			}
-			return respondData(claims, res, err)
+			return respondData(res, err)
 		} else if request.HTTPMethod == http.MethodGet && request.Resource == "/metadata/faculty/manage" {
 			colId := request.QueryStringParameters["college_id"]
 			fId, err := url.PathUnescape(request.QueryStringParameters["fId"])
 			if err != nil {
 				return AUTH_400, err
 			}
-			return respondData(claims, faculty.GetFacultiesData(colId, fId), err)
+			return respondData(faculty.GetFacultiesData(colId, fId), err)
 		} else if request.HTTPMethod == http.MethodDelete && request.Resource == "/metadata/faculty/delete" {
+			colId := request.QueryStringParameters["college_id"]
+			var facultyCreateForm faculty.Faculty
+			err = json.Unmarshal([]byte(request.Body), &facultyCreateForm)
+			if err != nil {
+				return AUTH_504, err
+			}
+			isDeactivated, errMessage := faculty.DeleteFaculty(colId, facultyCreateForm, userId)
+			if !isDeactivated {
+				return respondError(errMessage)
+			}
+			return respondData(errMessage, err)
+		} else if request.HTTPMethod == http.MethodDelete && request.Resource == "/metadata/faculty/deactivate" {
 			colId := request.QueryStringParameters["college_id"]
 			var facultyCreateForm faculty.Faculty
 			err = json.Unmarshal([]byte(request.Body), &facultyCreateForm)
@@ -335,7 +371,7 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 			if !isDeactivated {
 				return respondError(errMessage)
 			}
-			return respondData(claims, errMessage, err)
+			return respondData(errMessage, err)
 		} else if request.HTTPMethod == http.MethodPost && request.Resource == "/metadata/student/create" {
 			colId := request.QueryStringParameters["college_id"]
 			var studentOnboardForm students.Student
@@ -347,7 +383,7 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 			if err != nil {
 				return AUTH_504, err
 			}
-			return respondData(claims, sId, err)
+			return respondData(sId, err)
 		} else if request.HTTPMethod == http.MethodPost && request.Resource == "/metadata/student/update" {
 			colId := request.QueryStringParameters["college_id"]
 			var studentOnboardForm students.Student
@@ -359,7 +395,7 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 			if !sId && res != "" {
 				return respondError(res)
 			}
-			return respondData(claims, res, err)
+			return respondData(res, err)
 		} else if request.HTTPMethod == http.MethodDelete && request.Resource == "/metadata/student/delete" {
 			colId := request.QueryStringParameters["college_id"]
 			var studentOnboardForm students.Student
@@ -371,7 +407,7 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 			if !sId && res != "" {
 				return respondError(res)
 			}
-			return respondData(claims, res, err)
+			return respondData(res, err)
 		} else if request.HTTPMethod == http.MethodGet && request.Resource == "/metadata/student/manage" {
 			colId := request.QueryStringParameters["college_id"]
 			batch := request.QueryStringParameters["batch"]
@@ -380,16 +416,212 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 			if err != nil {
 				return AUTH_504, err
 			}
-			return respondData(claims, string(res), err)
+			return respondData(string(res), err)
 		}
 	}
 	return AUTH_404, errors.New("Resource not found")
+}
+
+func handleAdmission(request events.APIGatewayProxyRequest, uBy string) (string, error) {
+
+	colId := request.QueryStringParameters["college_id"]
+	contentType := request.Headers["content-type"]
+
+	if !strings.HasPrefix(contentType, "multipart/form-data") {
+		return "", errors.New("Invalid Content-Type")
+	}
+	boundary, err := extractBoundary(contentType)
+	if err != nil || boundary == "" {
+		log.Printf("Invalid boundary %v\n", err)
+		return "", errors.New("Invalid Boundary")
+	}
+	mr, err := awslambda.NewReaderMultipart(request)
+	fmt.Println("Inside handleAdmission - ")
+	formMap := make(map[string]string)
+	formFilesMap := make(map[string][]byte)
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Printf("Error reading multipart data %v\n", err)
+			return err.Error(), err
+		}
+		content, err := io.ReadAll(part)
+
+		// Skip non-file fields
+		if part.FileName() == "" {
+			formMap[part.FormName()] = string(content)
+			continue
+		}
+		if len(content) <= 0 {
+			return "", errors.New("Empty Files are not allowed to upload!!")
+		}
+		fType := strings.Split(part.FileName(), ".")[1]
+		fileKey := part.FormName() + "." + fType
+		formFilesMap[fileKey] = content
+		fileProps := make(map[string]string)
+		fileProps["type"] = fType
+		fileProps["key"] = fileKey
+		fileProps["uploaded"] = "true"
+		strFileProps, err := json.Marshal(fileProps)
+		if err != nil {
+			log.Printf("Error marshalling file properties %v\n", err)
+			return err.Error(), err
+		}
+		formMap[part.FormName()] = string(strFileProps)
+	}
+
+	jsonData, err := json.Marshal(formMap)
+	if err != nil {
+		log.Printf("Error marshalling form json %v\n", err)
+		return err.Error(), err
+	}
+	var student students.Student
+	err = json.Unmarshal(jsonData, &student)
+	if err != nil {
+		log.Printf("Error unmarshalling from json to struct %v\n", err)
+		return err.Error(), err
+	}
+	sId, err := students.OnboardStudentV2(colId, &student, uBy)
+	if err != nil {
+		return err.Error(), err
+	}
+	for k, v := range formFilesMap {
+		err = uploadToS3(k, v, sId, colId)
+		if err != nil {
+			log.Printf("Error uploading to s3 %s %s %s %v\n", sId, colId, k, err)
+			return err.Error(), err
+		}
+	}
+	return sId, nil
+}
+
+func uploadToS3(fileName string, fileData []byte, sId string, colId string) error {
+	_, err := s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
+		Bucket: aws.String("cerp-students"),
+		Key:    aws.String(colId + "/" + sId + "/" + fileName),
+		Body:   bytes.NewReader(fileData),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to upload %s to S3: %w", fileName, err)
+	}
+	return nil
+}
+
+func extractBoundary(contentType string) (string, error) {
+	_, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return "", err
+	}
+	log.Println(params)
+	boundary, exists := params["boundary"]
+	if !exists {
+		return "", fmt.Errorf("boundary not found in Content-Type")
+	}
+	log.Printf("boundary found: %s\n", boundary)
+	return "1073741824", nil
+}
+
+func handleEnquiry(roles string, request events.APIGatewayProxyRequest, uBy string, ctx context.Context, name string) (events.APIGatewayProxyResponse, error) {
+	if strings.Contains(roles, ROLE_ADMIN) || strings.Contains(roles, ROLE_COUNSELLOR) {
+		colId := request.QueryStringParameters["college_id"]
+		if request.HTTPMethod == http.MethodPost && strings.Contains(request.Resource, "/create") {
+			var formData enquiry.FormData
+			err := json.Unmarshal([]byte(request.Body), &formData)
+			if err != nil {
+				fmt.Println(err.Error())
+				return respondError(cfg_details.INVALID_DATA)
+			}
+			formData.CouncillorName = name
+			id, err := enquiry.AddEnqV2(pgInstance.db, ctx, formData, colId, uBy)
+			if err != nil {
+				fmt.Println(err.Error())
+				return respondError(cfg_details.INVALID_DATA)
+			}
+			return respondData201(id)
+		} else if request.HTTPMethod == http.MethodPut && strings.Contains(request.Resource, "/update") {
+			var formData enquiry.FormData
+			err := json.Unmarshal([]byte(request.Body), &formData)
+			if err != nil {
+				return respondError(cfg_details.INVALID_DATA)
+			}
+			err = enquiry.UpdateEnqV2(pgInstance.db, ctx, formData, colId, uBy)
+			if err != nil {
+				return respondError(cfg_details.INVALID_DATA)
+			}
+			return respondData("Updated", err)
+		} else if request.HTTPMethod == http.MethodGet && strings.Contains(request.Resource, "/list") {
+			formData, err := enquiry.ListEnqV2(pgInstance.db, ctx, colId)
+			if err != nil {
+				return respondError(cfg_details.INVALID_DATA)
+			}
+			res, err := json.Marshal(formData)
+			return respondData(string(res), err)
+		} else if request.HTTPMethod == http.MethodGet && strings.Contains(request.Resource, "/enq/get") {
+			eqId, err := strconv.ParseInt(request.QueryStringParameters["eq_id"], 10, 64)
+			if err != nil {
+				return respondError(cfg_details.INVALID_DATA)
+			}
+			formData, err := enquiry.GetEnqV2(pgInstance.db, ctx, eqId, colId)
+			if err != nil {
+				return respondError(cfg_details.INVALID_DATA)
+			}
+			res, err := json.Marshal(formData)
+			return respondData(string(res), err)
+		} else if request.HTTPMethod == http.MethodDelete && strings.Contains(request.Resource, "/delete") {
+			eqId, err := strconv.ParseInt(request.QueryStringParameters["eq_id"], 10, 64)
+			if err != nil {
+				return respondError(cfg_details.INPUT_ERROR)
+			}
+			err = enquiry.DelEnqV2(pgInstance.db, ctx, eqId, colId)
+			if err != nil {
+				return respondError(cfg_details.DATA_SERVICE_ERROR)
+			}
+			return respondData("Deleted", err)
+		} else if request.HTTPMethod == http.MethodPost && strings.Contains(request.Resource, "/comments/add") {
+			log.Println("Inside comments/add")
+			var comment enquiry.Comment
+			err := json.Unmarshal([]byte(request.Body), &comment)
+			if err != nil {
+				log.Println(err.Error())
+				return respondError(cfg_details.INPUT_ERROR)
+			}
+			err = enquiry.AddCommentV2(pgInstance.db, ctx, comment, colId)
+			if err != nil {
+				return respondError(cfg_details.DATA_SERVICE_ERROR)
+			}
+			log.Println("Inside comments/add - after inserting")
+			return respondData("Comment Added", err)
+		} else if request.HTTPMethod == http.MethodGet && strings.Contains(request.Resource, "/comments/get") {
+			log.Println("Inside comments/get")
+			eqId, err := strconv.ParseInt(request.QueryStringParameters["eq_id"], 10, 64)
+			if err != nil {
+				return respondError(cfg_details.INPUT_ERROR)
+			}
+			cmts, err := enquiry.GetCommentV2(pgInstance.db, ctx, eqId, colId)
+			log.Println("Inside comments/get - Queried")
+			if err != nil {
+				return respondError(cfg_details.DATA_SERVICE_ERROR)
+			}
+			res, err := json.Marshal(cmts)
+			if err != nil {
+				return respondError(cfg_details.CODE_ERROR)
+			}
+			log.Println("Inside comments/get - Marshaled")
+			return respondData(string(res), err)
+		}
+	}
+	return respondError("404")
 }
 
 func respondError(res string) (events.APIGatewayProxyResponse, error) {
 	switch res {
 	case cfg_details.INVALID_DATA:
 		return AUTH_403, errors.New(res)
+	case "404":
+		return AUTH_404, errors.New(res)
 	default:
 		return AUTH_504, errors.New(res)
 	}
@@ -411,50 +643,17 @@ type OnboardStudentsMetadata struct {
 	Updater  string `dynamodbav:"uBy"`
 }
 
-type AttendanceFormUpdater struct {
-	PK      string `dynamodbav:"sub"`
-	SK      string `dynamodbav:"date"`
-	Values  string `dynamodbav:"values"`
-	Ts      int64  `dynamodbav:"ts"`
-	Updater string `dynamodbav:"uBy"`
-}
-
-func updateAttendanceForm(colId string, course string, batch string, sub string, date string, req *attendanceForm) error {
-	key := strings.ToLower(course) + "_" + strings.ToLower(batch) + "_" + strings.ToLower(sub)
-	parsedReq, err := json.Marshal(req)
-	if err != nil {
-		return err
-	}
-	attendanceBook := AttendanceFormUpdater{
-		PK:      key,
-		SK:      date,
-		Values:  string(parsedReq),
-		Ts:      req.Ts,
-		Updater: req.UBy,
-	}
-	data, err := attributevalue.MarshalMap(attendanceBook)
-	_, err = DYNAMO_CFG.PutItem(context.TODO(), &dynamodb.PutItemInput{
-		TableName: aws.String("attendance" + "_" + colId),
-		Item:      data,
-	})
-
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func onboardStudentsAttendance(colId string, course string, batch string, userId string, reqBody string) (error, int64) {
+func onboardStudentsAttendance(colId string, course string, batch string, userId string, cs string, reqBody string) (error, int64) {
 	//reqBodyParsed := make(map[string]string)
 	//err := json.Unmarshal(reqBody, &reqBodyParsed)
 	fmt.Println(reqBody)
 	//if err != nil {
 	//	return err, 0
 	//}
-	ts := time.Now().UTC().Unix()
+	ts := time.Now().Unix()
 	subjects := OnboardStudentsMetadata{
 		PK:       colId,
-		SK:       strings.ToLower(course) + strings.ToLower(batch),
+		SK:       strings.ToLower(course) + "_" + strings.ToLower(batch) + "_" + strings.ToLower(cs),
 		Students: reqBody,
 		Ts:       ts,
 		Updater:  userId,
@@ -474,7 +673,7 @@ func OnboardSubjects(colId string, course string, batch string, userId string, r
 	if err != nil {
 		return err, 0
 	}
-	ts := time.Now().UTC().Unix()
+	ts := time.Now().Unix()
 	subjects := OnboardSubjectsMetadata{
 		PK:       colId + "_" + course,
 		SK:       batch,
@@ -513,69 +712,54 @@ func getSubjects(collegeId string, class string, batch string) string {
 	return fmt.Sprintf("%s", res)
 }
 
-func getAttendanceStudents(college string, course string, batch string, sub string, date string) (string, error) {
-	students, err := getStudents(college, course, batch)
-	studentsMap := make(map[string]int)
-	for i := 0; i < len(students); i++ {
-		studentsMap[students[i].Id] = i
+func getAttendanceStudents(college string, course string, batch string, sub string, date string, cs string) (string, error) {
+	studentsLst, err := getStudents(college, course, batch, cs)
+	if err != nil {
+		return "", err
 	}
-	aForm, err := getAttendanceForm(college, course, batch, sub, date)
+	sPerSub, err := onboard_data.GetS2SPerSub(college, course, batch, cs, sub)
+	if err != nil {
+		return "", err
+	}
+	filteredStudents := make([]attendance.Student, 0)
+	if sPerSub != nil {
+		for _, val := range studentsLst {
+			_, exist := sPerSub[val.Id]
+			if exist {
+				filteredStudents = append(filteredStudents, val)
+			}
+		}
+	}
+	if len(filteredStudents) > 0 {
+		studentsLst = filteredStudents
+	}
+	studentsMap := make(map[string]int)
+	for i := 0; i < len(studentsLst); i++ {
+		studentsMap[studentsLst[i].Id] = i
+	}
+	aForm, err := attendance.GetAttendanceForm(college, course, batch, sub, date, cs)
 	if err != nil {
 		return "", err
 	}
 	for _, sId := range aForm.Students {
 		if val, ok := studentsMap[sId]; ok {
-			students[val].IsPresent = true
+			studentsLst[val].IsPresent = true
 		}
 	}
-	res, err := json.Marshal(students)
+	finRes := make(map[string]interface{})
+	finRes["students"] = studentsLst
+	finRes["time_slot"] = aForm.TimeSlot
+	finRes["work_log"] = aForm.WorkLog
+	res, err := json.Marshal(finRes)
 	if err != nil {
 		return "", err
 	}
 	return string(res), nil
 }
 
-func getAttendanceForm(college string, course string, batch string, sub string, date string) (attendanceForm, error) {
-	key, err := attributevalue.Marshal(strings.ToLower(course) + "_" + strings.ToLower(batch) + "_" + strings.ToLower(sub))
-	sKey, err := attributevalue.Marshal(date)
-	if err != nil {
-		return attendanceForm{}, err
-	}
-	ck := map[string]types.AttributeValue{
-		"sub":  key,
-		"date": sKey,
-	}
-	out, err := DYNAMO_CFG.GetItem(context.Background(), &dynamodb.GetItemInput{
-		TableName: aws.String("attendance" + "_" + strings.ToLower(college)),
-		Key:       ck,
-	})
-	item := out.Item["values"]
-	if item == nil {
-		return attendanceForm{}, nil
-	}
-	var res1 string
-	fmt.Println(item)
-	err = attributevalue.Unmarshal(item, &res1)
-	var res attendanceForm
-	err = json.Unmarshal([]byte(res1), &res)
-	return res, err
-}
-
-type student struct {
-	Name      string `json:"name"`
-	Id        string `json:"id"`
-	IsPresent bool   `json:"isPresent"`
-}
-
-type attendanceForm struct {
-	Students []string `json:"students"`
-	Ts       int64    `json:"ts"`
-	UBy      string   `json:"u_by"`
-}
-
-func getStudents(college string, course string, batch string) ([]student, error) {
+func getStudents(college string, course string, batch string, cs string) ([]attendance.Student, error) {
 	key, err := attributevalue.Marshal(college)
-	sKey, err := attributevalue.Marshal(strings.ToLower(course) + strings.ToLower(batch))
+	sKey, err := attributevalue.Marshal(strings.ToLower(course) + "_" + strings.ToLower(batch) + "_" + strings.ToLower(cs))
 	if err != nil {
 		return nil, err
 	}
@@ -583,11 +767,10 @@ func getStudents(college string, course string, batch string) ([]student, error)
 		"key":  key,
 		"skey": sKey,
 	}
-	out, err := DYNAMO_CFG.GetItem(context.Background(), &dynamodb.GetItemInput{
+	out, err := cfg_details.DynamoCfg.GetItem(context.Background(), &dynamodb.GetItemInput{
 		TableName: aws.String("college_metadata"),
 		Key:       ck,
 	})
-	fmt.Println(out)
 	item := out.Item["students"]
 	if item == nil {
 		return nil, nil
@@ -595,7 +778,7 @@ func getStudents(college string, course string, batch string) ([]student, error)
 	fmt.Println(item)
 	var res string
 	err = attributevalue.Unmarshal(item, &res)
-	var parsedRes []student
+	var parsedRes []attendance.Student
 	err = json.Unmarshal([]byte(res), &parsedRes)
 	return parsedRes, err
 }
@@ -607,8 +790,9 @@ func parseHmacToken(token string) string {
 		return ""
 	}
 	tknParts := strings.Split(decodeString, ".")
-	currentTs := time.Now().UTC().Unix()
-	if tknTs, _ := strconv.ParseInt(tknParts[0], 10, 64); tknTs <= currentTs {
+	currentTs := time.Now().Unix()
+	tknTs, _ := strconv.ParseInt(tknParts[0], 10, 64)
+	if tknTs <= currentTs {
 		return ""
 	}
 	err = verifySignature(tknParts)
@@ -635,14 +819,15 @@ func getHmacData(exp int64, resp string, userId string) string {
 	return base64.URLEncoding.EncodeToString([]byte(tsMessage + "." + getSignature(uEnc)))
 }
 
-func respondData(claims jwt.MapClaims, response string, err error) (events.APIGatewayProxyResponse, error) {
+func respondData(response string, err error) (events.APIGatewayProxyResponse, error) {
 	if err != nil {
-		return AUTH_500, nil
+		return respondError(err.Error())
 	}
-	//respHeader := ResponseHeaders
-	//respHeader["cerp-api-token"] = tkn
-	//respHeader["Set-Cookie"] = "_cerp_api_=" + tkn + "; Domain=localhost; Path=/;Secure; HttpOnly;SameSite=None;Priority=Medium"
 	return events.APIGatewayProxyResponse{Body: response, StatusCode: 200, IsBase64Encoded: true, Headers: ResponseHeaders}, nil
+}
+
+func respondData201(response string) (events.APIGatewayProxyResponse, error) {
+	return events.APIGatewayProxyResponse{Body: response, StatusCode: 201, IsBase64Encoded: true, Headers: ResponseHeaders}, nil
 }
 
 func getSignature(encMessage string) string {
@@ -655,7 +840,7 @@ func getSignature(encMessage string) string {
 }
 
 func extractRoles(claims jwt.MapClaims) string {
-	roleArray := claims[cfg_details.ALLOWED_URL].([]interface{})
+	roleArray := claims[cfg_details.ALLOWED_URL+"roles"].([]interface{})
 	res := make([]string, len(roleArray))
 	for i := 0; i < len(roleArray); i++ {
 		res[i] = strings.ToLower(roleArray[i].(string))

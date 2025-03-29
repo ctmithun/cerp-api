@@ -12,8 +12,12 @@ import (
 	"net/http"
 )
 
+var BLOCK_USER_REQ_BODY = bytes.NewReader([]byte(`{
+	"blocked": true
+}`))
+
 func CreateAuth0User(body map[string]interface{}) string {
-	fmt.Println("Creating a user for %s", body)
+	fmt.Printf("Creating a user for %s", body)
 	body["password"] = generateRandomPsw()
 	url := cfg_details.API_URL + "/users"
 	marshalled, err := json.Marshal(body)
@@ -42,8 +46,9 @@ func CreateAuth0User(body map[string]interface{}) string {
 }
 
 func SetUserRoles(uId string, rErr *error, roles []byte) {
-	fmt.Printf("Inside setUserRoles\n")
+	fmt.Printf("Inside setUserRoles %s\n", uId)
 	url := cfg_details.API_URL + "/users/" + uId + "/roles"
+	fmt.Printf("Inside setUserRoles URL %s %s\n", url, roles)
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(roles))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -55,7 +60,7 @@ func SetUserRoles(uId string, rErr *error, roles []byte) {
 	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.Println("Error in roles setting")
+		log.Printf("Error in roles setting %v\n", err)
 		*rErr = err
 		return
 	} else if res.StatusCode >= 300 {
@@ -67,7 +72,23 @@ func SetUserRoles(uId string, rErr *error, roles []byte) {
 }
 
 func DeactivateUser(uId string, uBy string) error {
-	fmt.Println("Deactivating a user for %s by %s", uId, uBy)
+	fmt.Printf("Deactivating a user for %s by %s", uId, uBy)
+	url := cfg_details.API_URL + "/users/" + uId
+	req, err := http.NewRequest(http.MethodDelete, url, BLOCK_USER_REQ_BODY)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+cfg_details.TOKEN)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil || res.StatusCode >= 300 {
+		log.Println("User deactivation failed due to ", res.StatusCode)
+		return err
+	}
+	fmt.Printf("Deactivated user for %s by %s\n", uId, uBy)
+	return nil
+}
+
+func DeleteUser(uId string, uBy string) error {
+	fmt.Printf("Deactivating a user for %s by %s", uId, uBy)
 	url := cfg_details.API_URL + "/users/" + uId
 	req, err := http.NewRequest(http.MethodDelete, url, nil)
 	req.Header.Set("Content-Type", "application/json")

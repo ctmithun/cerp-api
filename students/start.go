@@ -18,17 +18,52 @@ import (
 )
 
 type Student struct {
-	Email                string `json:"email"`
-	Id                   string `json:"id"`
-	Name                 string `json:"name"`
-	PhoneNumber          string `json:"phone_number"`
-	Doj                  string `json:"doj"`
-	Sid                  string `json:"sid"`
-	Batch                string `json:"batch"`
-	Stream               string `json:"class"`
-	Fees                 int    `json:"fees"`
-	Type                 string `json:"type"`
-	UniversitySeatNumber string `json:"university_seat_number"`
+	Email                 string `json:"email"`
+	Id                    string `json:"id"`
+	Name                  string `json:"name"`
+	Mobile                string `json:"mobile"`
+	Branch                string `json:"branch"`
+	Batch                 string `json:"batch"`
+	Year                  string `json:"year"`
+	Yoa                   string `json:"yoa"`
+	AdmissionCounselor    string `json:"admission_counselor"`
+	FreeSeat              string `json:"free_seat"`
+	Installments          string `json:"installments"`
+	Reference             string `json:"reference"`
+	PreviousQualification string `json:"previous_qualification"`
+	YearOfPassing         string `json:"year_of_passing"`
+	TotalMarks            string `json:"total_marks"`
+	SecondLanguage        string `json:"second_lang"`
+	StateOfPrevQual       string `json:"state_of_prev_qual"`
+	Gender                string `json:"gender"`
+	Dob                   string `json:"dob"`
+	Nationality           string `json:"nationality"`
+	Religion              string `json:"religion"`
+	CasteCategory         string `json:"caste_category"`
+	GovtScholarship       string `json:"govt_scholarship"`
+	AnnualIncome          string `json:"annual_income"`
+	BplCard               string `json:"bpl_card"`
+	FatherName            string `json:"father_name"`
+	FatherOccupation      string `json:"father_occupation"`
+	FatherMobile          string `json:"father_mobile"`
+	MotherName            string `json:"mother_name"`
+	MotherOccupation      string `json:"mother_occupation"`
+	MotherMobile          string `json:"mother_mobile"`
+	SingleParent          string `json:"single_parent"`
+	Aadhar                string `json:"aadhar"`
+	Address               string `json:"address"`
+	Passport              string `json:"passport"`
+	BloodGroup            string `json:"blood_group"`
+	Doj                   string `json:"doj"`
+	Sid                   string `json:"sid"`
+	Fees                  int    `json:"fees"`
+	UniversitySeatNumber  string `json:"university_seat_number"`
+	Photo                 string `json:"photo"`
+	Signature             string `json:"signature"`
+	MarksCard             string `json:"other"`
+	TotalYearlyFees       string `json:"total_yearly_fees"`
+	AdmissionFees         string `json:"admission_fees"`
+	FeeReceipt            string `json:"fee_receipt"`
 }
 
 type OnboardStudentBasicData struct {
@@ -48,7 +83,7 @@ var marshalledRole, _ = json.Marshal(roleBody)
 func getStudentData(data *Student, uId string, college string) map[string]interface{} {
 	body := map[string]interface{}{
 		"email":          data.Email,
-		"phone_number":   "+91" + data.PhoneNumber,
+		"phone_number":   "+91" + data.Mobile,
 		"blocked":        false,
 		"email_verified": false,
 		"phone_verified": false,
@@ -62,12 +97,13 @@ func getStudentData(data *Student, uId string, college string) map[string]interf
 }
 
 func getStudentIdKey(college string, student Student) string {
-	return "S-" + college + "|" + student.Email + "_" + student.PhoneNumber
+	return "S-" + college + "|" + student.Email + "_" + student.Mobile
 }
 
+//go:deprecated
 func OnboardStudent(college string, student *Student, uBy string) (string, error) {
 	uId := cfg_details.GenerateUserId(getStudentIdKey(college, *student))
-	PKKey := student.Batch + "-" + student.Stream
+	PKKey := student.Batch + "-" + student.Branch
 	SKKey := getRowNumber(PKKey, college)
 	user := iam.CreateAuth0User(getStudentData(student, uId, college))
 	fmt.Println("User created by the id - ", user)
@@ -83,7 +119,6 @@ func OnboardStudent(college string, student *Student, uBy string) (string, error
 		iam.SetUserRoles(user, &err, marshalledRole)
 		fmt.Println("User roles updated")
 	}()
-	//inputVal := structToMap(student)
 	student.Sid = PKKey + "-" + strconv.Itoa(SKKey)
 	err = persistStudentRecord(college, student, PKKey, SKKey, uBy, false)
 	wg.Wait()
@@ -96,7 +131,7 @@ func persistStudentRecord(college string, student *Student, PKKey string, SKKey 
 		SK:        SKKey,
 		Sid:       student.Sid,
 		Value:     *student,
-		Ts:        time.Now().UTC().Unix(),
+		Ts:        time.Now().Unix(),
 		Updater:   uBy,
 	}
 	data, err := attributevalue.MarshalMap(onF)
@@ -110,38 +145,45 @@ func persistStudentRecord(college string, student *Student, PKKey string, SKKey 
 				":row": &types.AttributeValueMemberN{Value: strconv.Itoa(SKKey)},
 			},
 		})
-	} else {
-		_, err = cfg_details.DynamoCfg.UpdateItem(
-			context.TODO(),
-			&dynamodb.UpdateItemInput{
-				TableName: aws.String(college + "_students"),
-				Key: map[string]types.AttributeValue{
-					"pk":      &types.AttributeValueMemberS{Value: PKKey},
-					"row_num": &types.AttributeValueMemberN{Value: strconv.Itoa(SKKey)},
-				},
-				UpdateExpression: aws.String("SET #val.#Fees = :Fees, #val.#Name = :Name, #val.#Doj = :Doj, ts = :ts, uBy = :uBy"),
-				//ConditionExpression: aws.String("pk <> :pk AND row_num <> :row"),
-				ExpressionAttributeValues: map[string]types.AttributeValue{
-					":Fees": &types.AttributeValueMemberN{Value: strconv.Itoa(student.Fees)},
-					":Name": &types.AttributeValueMemberS{Value: student.Name},
-					":Doj":  &types.AttributeValueMemberS{Value: student.Doj},
-					":ts":   &types.AttributeValueMemberN{Value: strconv.FormatInt(time.Now().UTC().Unix(), 10)},
-					":uBy":  &types.AttributeValueMemberS{Value: uBy},
-				},
-				ExpressionAttributeNames: map[string]string{
-					"#val":  "value",
-					"#Name": "Name",
-					"#Doj":  "Doj",
-					"#Fees": "Fees",
-				},
-			},
-		)
 	}
 	if err != nil {
 		fmt.Printf("Student onboard Failed...\n")
 		return err
 	}
 	fmt.Printf("Updated table and waiting for rolesSet...\n")
+	return err
+}
+
+func updateStudentRecord(college string, student *Student, PKKey string, SKKey int, uBy string) error {
+	_, err := cfg_details.DynamoCfg.UpdateItem(
+		context.TODO(),
+		&dynamodb.UpdateItemInput{
+			TableName: aws.String(college + "_students"),
+			Key: map[string]types.AttributeValue{
+				"pk":      &types.AttributeValueMemberS{Value: PKKey},
+				"row_num": &types.AttributeValueMemberN{Value: strconv.Itoa(SKKey)},
+			},
+			UpdateExpression: aws.String("SET #val.#Fees = :Fees, #val.#Name = :Name, #val.#Doj = :Doj, ts = :ts, uBy = :uBy"),
+			//ConditionExpression: aws.String("pk <> :pk AND row_num <> :row"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":Fees": &types.AttributeValueMemberN{Value: strconv.Itoa(student.Fees)},
+				":Name": &types.AttributeValueMemberS{Value: student.Name},
+				":Doj":  &types.AttributeValueMemberS{Value: student.Doj},
+				":ts":   &types.AttributeValueMemberN{Value: strconv.FormatInt(time.Now().Unix(), 10)},
+				":uBy":  &types.AttributeValueMemberS{Value: uBy},
+			},
+			ExpressionAttributeNames: map[string]string{
+				"#val":  "value",
+				"#Name": "Name",
+				"#Doj":  "Doj",
+				"#Fees": "Fees",
+			},
+		},
+	)
+	if err != nil {
+		fmt.Printf("Student update failed...\n")
+		return err
+	}
 	return err
 }
 
@@ -190,7 +232,7 @@ func GetStudentsData(college string, batch string, stream string) []Student {
 		ExpressionAttributeNames: map[string]string{
 			"#val": "value",
 		},
-		ScanIndexForward: aws.Bool(false),
+		ScanIndexForward: aws.Bool(true),
 	})
 	if err != nil {
 		fmt.Println(err)
@@ -214,7 +256,7 @@ func UpdateStudentRecord(college string, student *Student, uBy string) (bool, st
 	if !strings.Contains(student.Id, user) {
 		return false, cfg_details.INVALID_DATA
 	}
-	PKKey := student.Batch + "-" + student.Stream
+	PKKey := strings.Split(student.Batch, "-")[0] + "-" + student.Branch
 	SKKey, err := extractRowNum(student.Sid)
 	if err != nil {
 		return false, cfg_details.INVALID_DATA
@@ -243,7 +285,7 @@ func DeactivateStudent(college string, student Student, uBy string) (bool, strin
 		fmt.Println("User deactivation failed in Auth0 - ", student.Id)
 		return false, cfg_details.AUTH0_UNAVAILABLE
 	}
-	PKKey := student.Batch + "-" + student.Stream
+	PKKey := student.Batch + "-" + student.Branch
 	SKKey, err := extractRowNum(student.Sid)
 	if err != nil {
 		fmt.Println("Error deactivating the student - ", student.Id)
@@ -261,4 +303,25 @@ func DeactivateStudent(college string, student Student, uBy string) (bool, strin
 		return false, ""
 	}
 	return true, ""
+}
+
+func GetStudents(college string, course string, batch string, cs string) (types.AttributeValue, error) {
+	key, err := attributevalue.Marshal(college)
+	sKey, err := attributevalue.Marshal(strings.ToLower(course) + "_" + strings.ToLower(batch) + "_" + strings.ToLower(cs))
+	if err != nil {
+		return nil, err
+	}
+	ck := map[string]types.AttributeValue{
+		"key":  key,
+		"skey": sKey,
+	}
+	out, err := cfg_details.DynamoCfg.GetItem(context.Background(), &dynamodb.GetItemInput{
+		TableName: aws.String("college_metadata"),
+		Key:       ck,
+	})
+	item := out.Item["students"]
+	if item == nil {
+		return nil, nil
+	}
+	return item, err
 }
