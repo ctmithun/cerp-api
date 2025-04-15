@@ -1,19 +1,26 @@
 package faculty
 
 import (
+	"bytes"
 	"cerpApi/cfg_details"
 	"cerpApi/iam"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"strings"
-	"sync"
-	"time"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 var CFG, _ = config.LoadDefaultConfig(context.TODO(), config.WithRegion("ap-south-1"))
@@ -254,7 +261,7 @@ func DeactivateFaculty(college string, facultyForm Faculty, uBy string) (bool, s
 	if !strings.Contains(facultyForm.Id, user) {
 		return false, cfg_details.INVALID_DATA
 	}
-	err := iam.DeleteUser(facultyForm.Id, uBy)
+	err := iam.DeactivateUser(facultyForm.Id, uBy)
 	if err != nil {
 		return false, err.Error()
 	}
@@ -270,18 +277,18 @@ func DeleteFaculty(college string, facultyForm Faculty, uBy string) (bool, strin
 	if err != nil {
 		return false, err.Error()
 	}
+	// item, err := cfg_details.DynamoCfg.DeleteItem(context.TODO(), &dynamodb.DeleteItemInput{
+	// 	TableName: aws.String(college + "_faculty"),
+	// 	Key: map[string]types.AttributeValue{
+	// 		"key":   &types.AttributeValueMemberS{Value: facultyForm.Id},
+	// 		"email": &types.AttributeValueMemberS{Value: facultyForm.Email},
+	// 	},
+	// })
+	// if err != nil || item == nil {
+	// 	fmt.Println("Error in deactivating faculty from the table - ", facultyForm.Id)
+	// 	return false, ""
+	// }
 	item, err := cfg_details.DynamoCfg.DeleteItem(context.TODO(), &dynamodb.DeleteItemInput{
-		TableName: aws.String(college + "_faculty"),
-		Key: map[string]types.AttributeValue{
-			"key":   &types.AttributeValueMemberS{Value: facultyForm.Id},
-			"email": &types.AttributeValueMemberS{Value: facultyForm.Email},
-		},
-	})
-	if err != nil || item == nil {
-		fmt.Println("Error in deactivating faculty from the table - ", facultyForm.Id)
-		return false, ""
-	}
-	item, err = cfg_details.DynamoCfg.DeleteItem(context.TODO(), &dynamodb.DeleteItemInput{
 		TableName: aws.String(college + "_faculty"),
 		Key: map[string]types.AttributeValue{
 			"key":   &types.AttributeValueMemberS{Value: college + "_faculty"},
@@ -298,4 +305,197 @@ func DeleteFaculty(college string, facultyForm Faculty, uBy string) (bool, strin
 
 func getFacultyIdKey(college string, facultyForm Faculty) string {
 	return "F-" + college + "|" + facultyForm.Email + "_" + facultyForm.PhoneNumber
+}
+
+func DeleteFacultyFile(s3Client *s3.Client, colId string, fId string, fileKey string, uBy string) (string, error) {
+	tableName := colId + "_files"
+	key := map[string]types.AttributeValue{
+		"uid": &types.AttributeValueMemberS{Value: fId}, // Change as needed
+	}
+	setVal := " SET"
+	expr := map[string]types.AttributeValue{}
+	setVal = setVal + " ts = :ts, uBy = :uBy"
+	expr[":ts"] = &types.AttributeValueMemberN{Value: fmt.Sprint(time.Now().Unix())}
+	expr[":uBy"] = &types.AttributeValueMemberS{Value: uBy}
+	aliasFileKey := strings.ReplaceAll(fileKey, ".", "")
+	exprNames := map[string]string{
+		"#fil":             "values",
+		"#" + aliasFileKey: fileKey,
+	}
+	updateInput := &dynamodb.UpdateItemInput{
+		TableName:                 aws.String(tableName),
+		Key:                       key,
+		UpdateExpression:          aws.String("REMOVE #fil.#" + aliasFileKey + setVal),
+		ExpressionAttributeNames:  exprNames,
+		ExpressionAttributeValues: expr,
+	}
+	_, err := cfg_details.DynamoCfg.UpdateItem(context.TODO(), updateInput)
+	if err != nil {
+		log.Printf("Error removing the key from dynamo %s %v\n", fileKey, err)
+		return "", err
+	}
+	err = RemoveFacultyFileFromS3(s3Client, colId, fId, fileKey)
+	if err != nil {
+		log.Printf("Error Removing file from S3 %s %s %v\n", fileKey, fId, err)
+		return "Not Removed", err
+	}
+	return "Removed!", nil
+}
+
+func UpdateFileMeta(colId string, formMap map[string]string, fId string, uBy string) (string, error) {
+	tableName := colId + "_files"
+	key := map[string]types.AttributeValue{
+		"uid": &types.AttributeValueMemberS{Value: fId}, // Change as needed
+	}
+	setVal := "SET"
+	expr := map[string]types.AttributeValue{}
+	exprNames := map[string]string{
+		"#fil": "values",
+	}
+	for k, v := range formMap {
+		if setVal != "SET" {
+			setVal = setVal + ","
+		}
+		aliasKey := strings.ReplaceAll(k, ".", "")
+		setVal = setVal + " #fil.#" + aliasKey + " = :" + aliasKey
+		expr[":"+aliasKey] = &types.AttributeValueMemberS{Value: v}
+		exprNames["#"+aliasKey] = k
+	}
+	setVal = setVal + ", ts = :ts, uBy = :uBy"
+	expr[":ts"] = &types.AttributeValueMemberN{Value: fmt.Sprint(time.Now().Unix())}
+	expr[":uBy"] = &types.AttributeValueMemberS{Value: uBy}
+	ind := 0
+	for {
+		updateInput := &dynamodb.UpdateItemInput{
+			TableName:                 aws.String(tableName),
+			Key:                       key,
+			UpdateExpression:          aws.String(setVal),
+			ExpressionAttributeNames:  exprNames,
+			ExpressionAttributeValues: expr,
+		}
+		_, err := cfg_details.DynamoCfg.UpdateItem(context.TODO(), updateInput)
+		if err != nil {
+			log.Printf("Failed to update item: %v", err)
+			err2 := insertItem(colId, fId, uBy)
+			if err2 != nil || ind == 2 {
+				return err.Error(), err
+			}
+			ind = ind + 1
+			log.Printf("Retrying for the %d times\n", ind+1)
+			continue
+		} else {
+			break
+		}
+	}
+	return "Updated!!", nil
+}
+
+type FileUpdater struct {
+	PK      string            `dynamodbav:"uid"`
+	Values  map[string]string `dynamodbav:"values"`
+	Ts      int64             `dynamodbav:"ts"`
+	Updater string            `dynamodbav:"uBy"`
+}
+
+func insertItem(colId string, uId string, uBy string) error {
+	fileBook := FileUpdater{
+		PK:      uId,
+		Values:  make(map[string]string),
+		Ts:      time.Now().Unix(),
+		Updater: uBy,
+	}
+	data, err := attributevalue.MarshalMap(fileBook)
+	if err != nil {
+		return err
+	}
+	_, err = cfg_details.DynamoCfg.PutItem(context.TODO(), &dynamodb.PutItemInput{
+		TableName: aws.String(colId + "_files"),
+		Item:      data,
+	})
+	return err
+}
+
+func UploadFacultyToS3(s3Client *s3.Client, fileName string, fileData []byte, id string, colId string) error {
+	_, err := s3Client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: aws.String(cfg_details.BUCKET_STUDENTS_FACULTIES),
+		Key:    aws.String(getFacultyS3Key(colId, id, fileName)),
+		Body:   bytes.NewReader(fileData),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to upload %s to S3: %w", fileName, err)
+	}
+	return nil
+}
+
+func RemoveFacultyFileFromS3(s3Client *s3.Client, colId string, id string, fileName string) error {
+	oldKey := getFacultyS3Key(colId, id, fileName)
+	newKey := getFacultyS3Key(colId, id, "rem_"+strconv.FormatInt(time.Now().Unix(), 10)+"_"+fileName)
+
+	// 1. Copy the object to new key
+	_, err := s3Client.CopyObject(context.TODO(), &s3.CopyObjectInput{
+		Bucket:     aws.String(cfg_details.BUCKET_STUDENTS_FACULTIES),
+		CopySource: aws.String(cfg_details.BUCKET_STUDENTS_FACULTIES + "/" + oldKey),
+		Key:        aws.String(newKey),
+		// Optional: Set tags (e.g., for lifecycle expiration)
+		Tagging:          aws.String("expire=true"),
+		TaggingDirective: s3types.TaggingDirectiveReplace,
+	})
+	if err != nil {
+		log.Printf("Failed to backup the deleting file %s %v\n", oldKey, err)
+	}
+	_, err = s3Client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
+		Bucket: aws.String(cfg_details.BUCKET_STUDENTS_FACULTIES),
+		Key:    aws.String(oldKey),
+	})
+	if err != nil {
+		log.Printf("failed to Delete key %s to S3: %v\n", oldKey, err)
+		return err
+	}
+	return nil
+}
+
+func getFacultyS3Key(colId string, id string, fileName string) string {
+	return colId + "/faculty/" + id + "/" + fileName
+}
+
+func DownloadFacultyFile(colId string, uId string, fName string, s3Client *s3.Client) (string, error) {
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(cfg_details.BUCKET_STUDENTS_FACULTIES),
+		Key:    aws.String(getFacultyS3Key(colId, uId, fName)),
+	}
+
+	presignedURL, err := cfg_details.Presigner.PresignGetObject(context.TODO(), input, s3.WithPresignExpires(60*time.Second))
+	if err != nil {
+		log.Printf("Error in dowloading the faculty file for s3 read operation - %s/%s err-%v\n", uId, fName, err)
+		return "", err
+	}
+	enc := url.QueryEscape(presignedURL.URL)
+	body, _ := json.Marshal(FileResponse{URL: enc})
+	return string(body), err
+}
+
+type FileResponse struct {
+	URL string `json:"url"`
+}
+
+func FetchFilesMetadata(colId string, uId string) (map[string]string, error) {
+	ck := map[string]types.AttributeValue{
+		"uid": &types.AttributeValueMemberS{Value: uId},
+	}
+	out, err := cfg_details.DynamoCfg.GetItem(context.Background(), &dynamodb.GetItemInput{
+		TableName: aws.String(colId + "_files"),
+		Key:       ck,
+	})
+	if err != nil {
+		log.Printf("Error in FetchFilesMetadata while reading data from DDB %v\n", err)
+		return nil, err
+	}
+	item := out.Item["values"]
+	var res map[string]string
+	err = attributevalue.Unmarshal(item, &res)
+	if err != nil {
+		log.Printf("Error in FetchFilesMetadata while unmarshaling the data from DDB %v\n", err)
+		return nil, err
+	}
+	return res, nil
 }

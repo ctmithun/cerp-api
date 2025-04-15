@@ -23,8 +23,8 @@ func OnboardStudentV2(college string, student *Student, uBy string) (string, err
 }
 
 func UpdateStudentV2(college string, student *Student, uBy string) (string, error) {
-	yoj := strings.Split(student.Batch, "-")[0]
-	log.Printf("Creating the student for the yoj number - %s\n", yoj)
+	// yoj := strings.Split(student.Batch, "-")[0]
+	// log.Printf("Updating the student for the yoj number - %s\n", yoj)
 	PKKey := student.Batch + "-" + student.Branch
 	sIdParts := strings.Split(student.Sid, "-")
 	SKKey, err := strconv.Atoi(sIdParts[len(sIdParts)-1])

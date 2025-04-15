@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -47,7 +48,7 @@ func TestAttendanceReport1(t *testing.T) {
 }
 
 func TestAttendanceReport2(t *testing.T) {
-	res := GetAttendanceReport("ni", "BCA", "2024-2027_SEM-2", "DS-24BCA", "A")
+	res := GetAttendanceReport("ni", "BCA", "2024-2027_SEM-2", "ENG-24BCA", "A")
 	//num := float64(1) / float64(3)
 	//num2 := float32(math.Round(num*10000) / 100)
 	//res1 := num2
@@ -61,4 +62,24 @@ func TestAttendanceReport2(t *testing.T) {
 		log.Printf("Test case failed for %v\n", err)
 	}
 	log.Printf("The output is %v\n", string(jsonRes))
+}
+
+func TestGetPmn(t *testing.T) {
+	item := getPmn("ni", "U18FE24S0001")
+	fmt.Println(item)
+}
+
+func TestGetPmnNaN(t *testing.T) {
+	item := getPmn("ni", "U18FR22C0101")
+	fmt.Println(item)
+}
+
+func TestStringMob(t *testing.T) {
+	mob := strings.Split("8901236541.0", ".")[0]
+	fmt.Print(mob)
+}
+
+func TestGetAttendanceForm(t *testing.T) {
+	res, _ := GetAttendanceForm("ni", "BBA", "2024-2027_SEM-2", "ET-25BBA", "8-4-2025", "A")
+	log.Printf("Res - %v\n", res)
 }

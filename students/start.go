@@ -7,14 +7,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 type Student struct {
@@ -67,12 +69,13 @@ type Student struct {
 }
 
 type OnboardStudentBasicData struct {
-	BatchYear string  `dynamodbav:"pk"`
-	SK        int     `dynamodbav:"row_num"`
-	Sid       string  `dynamodbav:"student_id"`
-	Value     Student `dynamodbav:"value"`
-	Ts        int64   `dynamodbav:"ts"`
-	Updater   string  `dynamodbav:"uBy"`
+	BatchYear          string  `dynamodbav:"pk"`
+	SK                 int     `dynamodbav:"row_num"`
+	Sid                string  `dynamodbav:"student_id"`
+	ParentMobileNumber string  `dynamodbav:"pmn"`
+	Value              Student `dynamodbav:"value"`
+	Ts                 int64   `dynamodbav:"ts"`
+	Updater            string  `dynamodbav:"uBy"`
 }
 
 var roleBody = map[string][]string{
@@ -126,13 +129,18 @@ func OnboardStudent(college string, student *Student, uBy string) (string, error
 }
 
 func persistStudentRecord(college string, student *Student, PKKey string, SKKey int, uBy string, isUpdate bool) error {
+	sId := student.Sid
+	if student.UniversitySeatNumber != "" {
+		sId = student.UniversitySeatNumber
+	}
 	onF := OnboardStudentBasicData{
-		BatchYear: PKKey,
-		SK:        SKKey,
-		Sid:       student.Sid,
-		Value:     *student,
-		Ts:        time.Now().Unix(),
-		Updater:   uBy,
+		BatchYear:          PKKey,
+		SK:                 SKKey,
+		Sid:                sId,
+		ParentMobileNumber: student.MotherMobile,
+		Value:              *student,
+		Ts:                 time.Now().Unix(),
+		Updater:            uBy,
 	}
 	data, err := attributevalue.MarshalMap(onF)
 	if !isUpdate {
@@ -154,7 +162,51 @@ func persistStudentRecord(college string, student *Student, PKKey string, SKKey 
 	return err
 }
 
+func getStructFieldNames(s interface{}) ([]reflect.StructField, map[string]string, string) {
+	val := reflect.TypeOf(s)
+	if val.Kind() == reflect.Ptr {
+		val = val.Elem()
+	}
+	var fieldNames []reflect.StructField
+	setVal := "SET"
+	exprNames := map[string]string{
+		"#val": "value",
+	}
+	for i := 0; i < val.NumField(); i++ {
+		field := val.Field(i)
+		k := field.Name
+		fieldNames = append(fieldNames, field)
+		if setVal != "SET" {
+			setVal = setVal + ","
+		}
+		setVal = setVal + " #val.#" + k + " = :" + k
+		exprNames["#"+k] = k
+	}
+	setVal = setVal + ", ts = :ts, uBy = :uBy"
+	return fieldNames, exprNames, setVal
+}
+
+var updateStudentFields, updateNames, setExpr = getStructFieldNames(Student{})
+
 func updateStudentRecord(college string, student *Student, PKKey string, SKKey int, uBy string) error {
+	exprVals := map[string]types.AttributeValue{}
+	val := reflect.ValueOf(*student)
+	for i := 0; i < len(updateStudentFields); i++ {
+		field := updateStudentFields[i]
+		k := field.Name
+		fVal := val.FieldByName(k)
+		kind := fVal.Kind()
+		switch kind {
+		case reflect.String:
+			exprVals[":"+k] = &types.AttributeValueMemberS{Value: fVal.String()}
+		case reflect.Int:
+			exprVals[":"+k] = &types.AttributeValueMemberN{Value: strconv.FormatInt(fVal.Int(), 10)}
+		}
+	}
+	// exprVals[":pk"] = &types.AttributeValueMemberS{Value: PKKey}
+	// exprVals[":row"] = &types.AttributeValueMemberS{Value: strconv.Itoa(SKKey)}
+	exprVals[":uBy"] = &types.AttributeValueMemberS{Value: uBy}
+	exprVals[":ts"] = &types.AttributeValueMemberS{Value: strconv.FormatInt(time.Now().Unix(), 10)}
 	_, err := cfg_details.DynamoCfg.UpdateItem(
 		context.TODO(),
 		&dynamodb.UpdateItemInput{
@@ -163,25 +215,26 @@ func updateStudentRecord(college string, student *Student, PKKey string, SKKey i
 				"pk":      &types.AttributeValueMemberS{Value: PKKey},
 				"row_num": &types.AttributeValueMemberN{Value: strconv.Itoa(SKKey)},
 			},
-			UpdateExpression: aws.String("SET #val.#Fees = :Fees, #val.#Name = :Name, #val.#Doj = :Doj, ts = :ts, uBy = :uBy"),
-			//ConditionExpression: aws.String("pk <> :pk AND row_num <> :row"),
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":Fees": &types.AttributeValueMemberN{Value: strconv.Itoa(student.Fees)},
-				":Name": &types.AttributeValueMemberS{Value: student.Name},
-				":Doj":  &types.AttributeValueMemberS{Value: student.Doj},
-				":ts":   &types.AttributeValueMemberN{Value: strconv.FormatInt(time.Now().Unix(), 10)},
-				":uBy":  &types.AttributeValueMemberS{Value: uBy},
-			},
-			ExpressionAttributeNames: map[string]string{
-				"#val":  "value",
-				"#Name": "Name",
-				"#Doj":  "Doj",
-				"#Fees": "Fees",
-			},
+			UpdateExpression:          aws.String(setExpr),
+			ExpressionAttributeValues: exprVals,
+			// map[string]types.AttributeValue{
+			// 	":Fees": &types.AttributeValueMemberN{Value: strconv.Itoa(student.Fees)},
+			// 	":Name": &types.AttributeValueMemberS{Value: student.Name},
+			// 	":Doj":  &types.AttributeValueMemberS{Value: student.Doj},
+			// 	":ts":   &types.AttributeValueMemberN{Value: strconv.FormatInt(time.Now().Unix(), 10)},
+			// 	":uBy":  &types.AttributeValueMemberS{Value: uBy},
+			// },
+			ExpressionAttributeNames: updateNames,
+			// map[string]string{
+			// 	"#val":  "value",
+			// 	"#Name": "Name",
+			// 	"#Doj":  "Doj",
+			// 	"#Fees": "Fees",
+			// },
 		},
 	)
 	if err != nil {
-		fmt.Printf("Student update failed...\n")
+		fmt.Printf("Student update failed...%v\n", err)
 		return err
 	}
 	return err
@@ -247,7 +300,6 @@ func GetStudentsData(college string, batch string, stream string) []Student {
 		err = attributevalue.Unmarshal(items[i]["value"], &student)
 		res[i] = student
 	}
-	fmt.Println("Collected data is - ", data)
 	return res
 }
 

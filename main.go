@@ -17,6 +17,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
+	"mime"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -30,15 +40,6 @@ import (
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/grokify/go-awslambda"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"io"
-	"log"
-	"mime"
-	"net/http"
-	"net/url"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
 )
 
 //const (
@@ -341,6 +342,14 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 				return respondError(res)
 			}
 			return respondData(res, err)
+		} else if request.HTTPMethod == http.MethodPost && request.Resource == "/metadata/faculty/upload" {
+			return respondData(handleFacultyMetadataUpload(&request, userId))
+		} else if request.HTTPMethod == http.MethodGet && request.Resource == "/metadata/faculty/files" {
+			return respondData(handleFacultyMetadataDownload(&request))
+		} else if request.HTTPMethod == http.MethodDelete && request.Resource == "/metadata/faculty/files" {
+			return respondData(handleFacultyMetadataRemove(&request, userId))
+		} else if request.HTTPMethod == http.MethodGet && request.Resource == "/metadata/faculty/filedata" {
+			return respondData(handleFacultyMetadataFileData(&request))
 		} else if request.HTTPMethod == http.MethodGet && request.Resource == "/metadata/faculty/manage" {
 			colId := request.QueryStringParameters["college_id"]
 			fId, err := url.PathUnescape(request.QueryStringParameters["fId"])
@@ -412,36 +421,96 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 			colId := request.QueryStringParameters["college_id"]
 			batch := request.QueryStringParameters["batch"]
 			stream := request.QueryStringParameters["class"]
-			res, err := json.Marshal(students.GetStudentsData(colId, batch, stream))
-			if err != nil {
-				return AUTH_504, err
+			subStreams := strings.Split(request.QueryStringParameters["sub_classes"], ",")
+			if len(subStreams) > 0 && subStreams[0] != "" {
+				mRes := make([]students.Student, 0)
+				for i := 0; i < len(subStreams); i++ {
+					res := students.GetStudentsData(colId, batch, stream+"-"+subStreams[i])
+					mRes = append(mRes, res...)
+				}
+				res, err := json.Marshal(mRes)
+				return respondData(string(res), err)
 			}
+			res, err := json.Marshal(students.GetStudentsData(colId, batch, stream))
 			return respondData(string(res), err)
+		} else if request.HTTPMethod == http.MethodGet && request.Resource == "/v2/metadata/student/update" {
+			res, err := handleStudentDataUpdate(&request, userId)
+			return respondData(res, err)
 		}
+
 	}
 	return AUTH_404, errors.New("Resource not found")
 }
 
-func handleAdmission(request events.APIGatewayProxyRequest, uBy string) (string, error) {
+func handleFacultyMetadataFileData(req *events.APIGatewayProxyRequest) (string, error) {
+	colId := req.QueryStringParameters["college_id"]
+	fId, err := url.PathUnescape(req.QueryStringParameters["fId"])
+	if err != nil {
+		return "", err
+	}
+	res, err := faculty.FetchFilesMetadata(colId, fId)
+	if err != nil {
+		return "", err
+	}
+	mRes, err := json.Marshal(res)
+	return string(mRes), err
+}
 
+func handleFacultyMetadataDownload(request *events.APIGatewayProxyRequest) (string, error) {
 	colId := request.QueryStringParameters["college_id"]
+	fId, err := url.PathUnescape(request.QueryStringParameters["fId"])
+	if err != nil {
+		log.Printf("Error in handleFacultyMetadataDownload for Decoding fId %v\n", err)
+	}
+	fName, err := url.PathUnescape(request.QueryStringParameters["f_name"])
+	if err != nil {
+		log.Printf("Error in handleFacultyMetadataDownload for Decoding fName %v\n", err)
+		return "", err
+	}
+	return faculty.DownloadFacultyFile(colId, fId, fName, s3Client)
+}
+
+func handleFacultyMetadataRemove(request *events.APIGatewayProxyRequest, uId string) (string, error) {
+	colId := request.QueryStringParameters["college_id"]
+	fId, err := url.PathUnescape(request.QueryStringParameters["fId"])
+	if err != nil {
+		log.Printf("Error in handleFacultyMetadataRemove for Decoding fId %v\n", err)
+	}
+	fName, err := url.PathUnescape(request.QueryStringParameters["f_name"])
+	if err != nil {
+		log.Printf("Error in handleFacultyMetadataRemove for Decoding fName %v\n", err)
+		return "", err
+	}
+	_, err = faculty.DeleteFacultyFile(s3Client, colId, fId, fName, uId)
+	if err != nil {
+		return err.Error(), err
+	}
+	return "", nil
+}
+
+func handleFacultyMetadataUpload(request *events.APIGatewayProxyRequest, uBy string) (string, error) {
+	colId := request.QueryStringParameters["college_id"]
+	fId, err := url.PathUnescape(request.QueryStringParameters["fId"])
+	if err != nil {
+		return "", err
+	}
 	contentType := request.Headers["content-type"]
 
 	if !strings.HasPrefix(contentType, "multipart/form-data") {
-		return "", errors.New("Invalid Content-Type")
+		return "", errors.New("invalid content-type")
 	}
 	boundary, err := extractBoundary(contentType)
 	if err != nil || boundary == "" {
 		log.Printf("Invalid boundary %v\n", err)
-		return "", errors.New("Invalid Boundary")
+		return "", errors.New("invalid boundary")
 	}
-	mr, err := awslambda.NewReaderMultipart(request)
-	fmt.Println("Inside handleAdmission - ")
+	mr, err := awslambda.NewReaderMultipart(*request)
 	formMap := make(map[string]string)
 	formFilesMap := make(map[string][]byte)
 	for {
 		part, err := mr.NextPart()
 		if err == io.EOF {
+			log.Printf("Error reading the nextPart %v\n", err)
 			break
 		}
 		if err != nil {
@@ -456,10 +525,13 @@ func handleAdmission(request events.APIGatewayProxyRequest, uBy string) (string,
 			continue
 		}
 		if len(content) <= 0 {
+			log.Printf("No content in the uploaded file %s\n", part.FileName())
 			return "", errors.New("Empty Files are not allowed to upload!!")
 		}
-		fType := strings.Split(part.FileName(), ".")[1]
+		arr := strings.Split(part.FileName(), ".")
+		fType := arr[len(arr)-1]
 		fileKey := part.FormName() + "." + fType
+		log.Printf("File Key is %s\n", fileKey)
 		formFilesMap[fileKey] = content
 		fileProps := make(map[string]string)
 		fileProps["type"] = fType
@@ -470,9 +542,116 @@ func handleAdmission(request events.APIGatewayProxyRequest, uBy string) (string,
 			log.Printf("Error marshalling file properties %v\n", err)
 			return err.Error(), err
 		}
+		formMap[fileKey] = string(strFileProps)
+	}
+	if err != nil {
+		return err.Error(), err
+	}
+	log.Printf("Filesmap is %v\n", formFilesMap)
+	for k, v := range formFilesMap {
+		err = faculty.UploadFacultyToS3(s3Client, k, v, fId, colId)
+		log.Printf("Uploaded the file %s %s\n", k, fId)
+		if err != nil {
+			log.Printf("Error uploading to s3 %s %s %s %v\n", fId, colId, k, err)
+			return err.Error(), err
+		}
+	}
+	resp, err := faculty.UpdateFileMeta(colId, formMap, fId, uBy)
+	return resp, err
+}
+
+func processStudentData(colId string, request *events.APIGatewayProxyRequest) (map[string][]byte, map[string]string, error) {
+	contentType := request.Headers["content-type"]
+	if contentType == "" {
+		contentType = request.Headers["Content-Type"]
+	}
+	if !strings.HasPrefix(contentType, "multipart/form-data") {
+		return nil, nil, errors.New("Invalid Content-Type")
+	}
+	boundary, err := extractBoundary(contentType)
+	if err != nil || boundary == "" {
+		log.Printf("Invalid boundary %v\n", err)
+		return nil, nil, errors.New("Invalid Boundary")
+	}
+	mr, err := awslambda.NewReaderMultipart(*request)
+	formMap := make(map[string]string)
+	formFilesMap := make(map[string][]byte)
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Printf("Error reading multipart data %v\n", err)
+			return nil, nil, err
+		}
+		content, err := io.ReadAll(part)
+
+		// Skip non-file fields
+		if part.FileName() == "" {
+			formMap[part.FormName()] = string(content)
+			continue
+		}
+		if len(content) <= 0 {
+			return nil, nil, errors.New("Empty Files are not allowed to upload!!")
+		}
+		arr := strings.Split(part.FileName(), ".")
+		fType := arr[len(arr)-1]
+		fileKey := part.FormName() + "." + fType
+		formFilesMap[fileKey] = content
+		fileProps := make(map[string]string)
+		fileProps["type"] = fType
+		fileProps["key"] = fileKey
+		fileProps["uploaded"] = "true"
+		strFileProps, err := json.Marshal(fileProps)
+		if err != nil {
+			log.Printf("Error marshalling file properties %v\n", err)
+			return nil, nil, err
+		}
 		formMap[part.FormName()] = string(strFileProps)
 	}
+	return formFilesMap, formMap, nil
+}
 
+func handleStudentDataUpdate(request *events.APIGatewayProxyRequest, uBy string) (string, error) {
+	colId := request.QueryStringParameters["college_id"]
+	formFilesMap, formMap, err := processStudentData(colId, request)
+	if err != nil {
+		log.Printf("Error in processing the payload %v\n", err)
+		return "", err
+	}
+	jsonData, err := json.Marshal(formMap)
+	if err != nil {
+		log.Printf("Error marshalling form json %v\n", err)
+		return err.Error(), err
+	}
+	var student students.Student
+	err = json.Unmarshal(jsonData, &student)
+	if err != nil {
+		log.Printf("Error unmarshalling from json to struct %v\n", err)
+		return err.Error(), err
+	}
+	sId, err := students.UpdateStudentV2(colId, &student, uBy)
+	if err != nil {
+		return err.Error(), err
+	}
+	for k, v := range formFilesMap {
+		err = uploadToS3(k, v, sId, colId)
+		if err != nil {
+			log.Printf("Error uploading to s3 %s %s %s %v\n", sId, colId, k, err)
+			return err.Error(), err
+		}
+	}
+	return sId, nil
+}
+
+func handleAdmission(request events.APIGatewayProxyRequest, uBy string) (string, error) {
+	colId := request.QueryStringParameters["college_id"]
+	formFilesMap, formMap, err := processStudentData(colId, &request)
+	if err != nil {
+		log.Printf("Error in processing the payload %v\n", err)
+		return "", err
+	}
 	jsonData, err := json.Marshal(formMap)
 	if err != nil {
 		log.Printf("Error marshalling form json %v\n", err)
@@ -498,10 +677,10 @@ func handleAdmission(request events.APIGatewayProxyRequest, uBy string) (string,
 	return sId, nil
 }
 
-func uploadToS3(fileName string, fileData []byte, sId string, colId string) error {
+func uploadToS3(fileName string, fileData []byte, id string, colId string) error {
 	_, err := s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket: aws.String("cerp-students"),
-		Key:    aws.String(colId + "/" + sId + "/" + fileName),
+		Key:    aws.String(colId + "/" + id + "/" + fileName),
 		Body:   bytes.NewReader(fileData),
 	})
 	if err != nil {
@@ -738,6 +917,7 @@ func getAttendanceStudents(college string, course string, batch string, sub stri
 		studentsMap[studentsLst[i].Id] = i
 	}
 	aForm, err := attendance.GetAttendanceForm(college, course, batch, sub, date, cs)
+	log.Printf("aForm - %v\n", aForm)
 	if err != nil {
 		return "", err
 	}

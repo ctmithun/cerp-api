@@ -20,3 +20,12 @@ func TestGetAttendanceStudents2(t *testing.T) {
 	}
 	fmt.Println(students)
 }
+
+func TestGetAttendanceStudents3(t *testing.T) {
+	// college_id=ni&class=BBA&batch=2024-2027_SEM-2&subject=ET-25BBA&date=9-4-2025&class_section=A
+	students, err := getAttendanceStudents("ni", "BBA", "2024-2027_SEM-2", "ET-25BBA", "9-4-2025", "A")
+	if err != nil {
+		return
+	}
+	fmt.Println(students)
+}

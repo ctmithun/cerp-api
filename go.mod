@@ -45,4 +45,5 @@ require (
 	golang.org/x/crypto v0.31.0 // indirect
 	golang.org/x/sync v0.10.0 // indirect
 	golang.org/x/text v0.21.0 // indirect
+	// github.com/aws/aws-sdk-go-v2/feature/s3/presign v1.17.21
 )

@@ -10,12 +10,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const UT_USER = "UTUser"
@@ -138,8 +139,9 @@ func TestAddEnqV2(t *testing.T) {
 			UpdatedBy:      "323kjahe2398",
 			Batch:          "25-26",
 			Ts:             current_time.Format("2006-01-02 15:04:05"),
+			Doe:            "2025-04-04",
 		}
-		err = AddEnqV2(db, ctx, frmData, "ni", "")
+		_, err = AddEnqV2(db, ctx, frmData, "ni", "")
 		db.Close()
 		if err != nil {
 			fmt.Println("Insertion failed - ")

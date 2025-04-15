@@ -4,11 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"log"
 	"strconv"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type Comment struct {
@@ -33,11 +34,12 @@ type FormData struct {
 	Batch          string `json:"batch"`
 	PrevQual       string `json:"prev_qual"`
 	Ts             string `json:"ts"`
+	Doe            string `json:"doe"`
 }
 
 func ListEnqV2(con *pgxpool.Pool, ctx context.Context, colId string) ([]FormData, error) {
 	tableName := getEnqTableName(colId)
-	rows, err := con.Query(ctx, "select id, name, course, mobile, parent_mobile, status, councillor_name, location from "+tableName+" order by id desc limit 500")
+	rows, err := con.Query(ctx, "select id, name, course, mobile, parent_mobile, status, councillor_name, location, doe from "+tableName+" order by id desc limit 500")
 	if err != nil {
 		fmt.Println("Error querying the Eq table for fetching - " + err.Error())
 	}
@@ -45,8 +47,10 @@ func ListEnqV2(con *pgxpool.Pool, ctx context.Context, colId string) ([]FormData
 	for rows.Next() {
 		var pR FormData
 		var ts time.Time
-		err := rows.Scan(&pR.Id, &pR.Name, &pR.Course, &pR.Mobile, &pR.ParentMobile, &pR.Status, &pR.CouncillorName, &pR.Location)
+		var doe time.Time
+		err := rows.Scan(&pR.Id, &pR.Name, &pR.Course, &pR.Mobile, &pR.ParentMobile, &pR.Status, &pR.CouncillorName, &pR.Location, &doe)
 		pR.Ts = ts.Format("2006-01-02 15:04:05")
+		pR.Doe = doe.Format("2006-01-02")
 		if err != nil {
 			fmt.Println("Error querying the Eq table for fetching - " + err.Error())
 			return nil, err
@@ -74,7 +78,7 @@ func GetEnqV2(con *pgxpool.Pool, ctx context.Context, id int64, colId string) (F
 	for rows.Next() {
 		var ts time.Time
 		err := rows.Scan(&pR.Id, &pR.Name, &pR.Course, &pR.Location, &pR.CouncillorId, &pR.CouncillorName, &pR.Mobile, &pR.Reference,
-			&pR.Status, &pR.UpdatedBy, &ts, &pR.Batch, &pR.PrevQual, &pR.ParentMobile)
+			&pR.Status, &pR.UpdatedBy, &ts, &pR.Batch, &pR.PrevQual, &pR.ParentMobile, &pR.Doe)
 		pR.Ts = ts.Format("2006-01-02 15:04:05")
 		if err != nil {
 			fmt.Println("Error querying the Eq table for fetching - " + err.Error())
@@ -111,6 +115,10 @@ func AddCommentV2(con *pgxpool.Pool, ctx context.Context, comments Comment, colI
 		"eq_id":   comments.EqId,
 	}
 	row, err := con.Query(ctx, query, args)
+	if err != nil {
+		log.Printf("Error while creating connection %v\n", err)
+		return err
+	}
 	defer row.Close()
 	if err != nil {
 		fmt.Println("Error querying the Comments table for inserting - Query - " + err.Error())
@@ -148,9 +156,9 @@ func GetCommentV2(con *pgxpool.Pool, ctx context.Context, id int64, colId string
 func UpdateEnqV2(con *pgxpool.Pool, ctx context.Context, formData FormData, colId string, uBy string) error {
 	tableName := getEnqTableName(colId)
 	query := `Update ` + tableName + ` set name=$1, mobile=$2, parent_mobile=$3, status=$4, prev_qual=$7, u_by=$5, location=$8, 
-					reference=$9 WHERE id = $6`
+					reference=$9, doe=$10 WHERE id = $6`
 	_, err := con.Exec(ctx, query, formData.Name, formData.Mobile, formData.ParentMobile, formData.Status, uBy, formData.Id,
-		formData.PrevQual, formData.Location, formData.Reference)
+		formData.PrevQual, formData.Location, formData.Reference, formData.Doe)
 	if err != nil {
 		fmt.Println("Error deleting the Eq table - " + err.Error())
 	}
@@ -160,9 +168,9 @@ func UpdateEnqV2(con *pgxpool.Pool, ctx context.Context, formData FormData, colI
 func AddEnqV2(con *pgxpool.Pool, ctx context.Context, eqForm FormData, colId string, uBy string) (string, error) {
 	tableName := getEnqTableName(colId)
 	query := `INSERT INTO ` + tableName + ` ("name", "course", "location", "councillor_id", "councillor_name", "mobile", "parent_mobile", 
-				"reference", "status", "u_by", "batch", "prev_qual")
+				"reference", "status", "u_by", "batch", "prev_qual", "doe")
 				values (@name, @course, @location, @councillor_id, @councillor_name, @mobile, @parent_mobile, @reference, @status, 
-				@u_by, @batch, @prev_qual)
+				@u_by, @batch, @prev_qual, @doe)
 				RETURNING id`
 	args := pgx.NamedArgs{
 		"name":            eqForm.Name,
@@ -177,6 +185,7 @@ func AddEnqV2(con *pgxpool.Pool, ctx context.Context, eqForm FormData, colId str
 		"u_by":            uBy,
 		"batch":           eqForm.Batch,
 		"prev_qual":       eqForm.PrevQual,
+		"doe":             eqForm.Doe,
 	}
 	rows, err := con.Query(context.TODO(), query, args)
 	if err != nil {

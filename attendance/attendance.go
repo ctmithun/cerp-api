@@ -7,14 +7,16 @@ import (
 	"cerpApi/subject"
 	"context"
 	"encoding/json"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"log"
 	"math"
 	"sort"
 	"strings"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 type Student struct {
@@ -42,6 +44,8 @@ type AttendanceForm struct {
 }
 
 var isTest = false
+
+const Attendance_Date_Format = "2-1-2006"
 
 func GetAttendanceForm(college string, course string, batch string, sub string, date string, cs string) (AttendanceForm, error) {
 	key, err := getAttendanceKey(course, batch, sub, cs)
@@ -102,16 +106,16 @@ func processAbsenteesSmsNotifications(colId string, course string, batch string,
 	}
 	absentees := make([]interface{}, 0)
 	for _, stud := range fullStudentsSet {
-		if !presentMap[stud.Id] && (stud.NotifyMobile != "" || isTest) {
-			if isTest {
-				stud.NotifyMobile = "9743213012"
+		if !presentMap[stud.Id] {
+			mobile := getPmn(colId, stud.Id)
+			if mobile != "" && mobile != "nan" {
+				notifyData := map[string]string{
+					"mobile": mobile,
+					"id":     stud.Id,
+					"name":   stud.Name,
+				}
+				absentees = append(absentees, notifyData)
 			}
-			notifyData := map[string]string{
-				"mobile": stud.NotifyMobile,
-				"id":     stud.Id,
-				"name":   stud.Name,
-			}
-			absentees = append(absentees, notifyData)
 		}
 	}
 	notifyWrapper := notifications.AbsentNotificationWrapper{
@@ -122,6 +126,28 @@ func processAbsenteesSmsNotifications(colId string, course string, batch string,
 		Subject:       subName,
 	}
 	notifications.NotifyUsers(notifyWrapper, "Q")
+}
+
+func getPmn(colId string, sid string) string {
+	input := &dynamodb.QueryInput{
+		TableName:              aws.String(colId + "_students"),
+		IndexName:              aws.String("student_id-index"), // GSI name
+		KeyConditionExpression: aws.String("student_id = :sid"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":sid": &types.AttributeValueMemberS{Value: sid},
+		},
+		ProjectionExpression: aws.String("pmn"),
+	}
+	result, err := cfg_details.DynamoCfg.Query(context.TODO(), input)
+	if err != nil {
+		log.Printf("failed to query GSI, %v for %s\n", err, sid)
+	}
+	if len(result.Items) > 0 {
+		attr := result.Items[0]["pmn"].(*types.AttributeValueMemberS)
+		mob := strings.Split(attr.Value, ".")[0]
+		return mob
+	}
+	return ""
 }
 
 func updateAttendanceForm(colId string, course string, batch string, sub string, date string, cs string, req *AttendanceForm) error {
@@ -204,14 +230,24 @@ func GetAttendanceReport(college string, course string, batch string, sub string
 		log.Printf("Error Fetching the batchGetItems %v\n", err)
 	}
 	dates := make([]string, 0)
+	parsedDates := make([]time.Time, 0)
 	datesToAttendanceMap := make(map[string]Item)
 	for _, item := range items {
 		dates = append(dates, item.Date)
 		datesToAttendanceMap[item.Date] = item
+		t, err := time.Parse(Attendance_Date_Format, item.Date)
+		if err != nil {
+			log.Printf("Error Parsing date %v\n", err)
+			return ""
+		}
+		parsedDates = append(parsedDates, t)
 	}
-	sort.Slice(dates, func(i, j int) bool {
-		return dates[i] < dates[j]
+	sort.Slice(parsedDates, func(i, j int) bool {
+		return parsedDates[i].Before(parsedDates[j])
 	})
+	for i := 0; i < len(parsedDates); i++ {
+		dates[i] = parsedDates[i].Format(Attendance_Date_Format)
+	}
 	attendanceRecords := generateReport(dates, studMap, datesToAttendanceMap)
 	if attendanceRecords != nil {
 		res, err := json.Marshal(AttendancePerClass{
