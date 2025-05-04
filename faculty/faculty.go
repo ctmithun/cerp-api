@@ -427,17 +427,18 @@ func UploadFacultyToS3(s3Client *s3.Client, fileName string, fileData []byte, id
 	return nil
 }
 
+var tags = cfg_details.ExpireTags()
+
 func RemoveFacultyFileFromS3(s3Client *s3.Client, colId string, id string, fileName string) error {
 	oldKey := getFacultyS3Key(colId, id, fileName)
 	newKey := getFacultyS3Key(colId, id, "rem_"+strconv.FormatInt(time.Now().Unix(), 10)+"_"+fileName)
 
 	// 1. Copy the object to new key
 	_, err := s3Client.CopyObject(context.TODO(), &s3.CopyObjectInput{
-		Bucket:     aws.String(cfg_details.BUCKET_STUDENTS_FACULTIES),
-		CopySource: aws.String(cfg_details.BUCKET_STUDENTS_FACULTIES + "/" + oldKey),
-		Key:        aws.String(newKey),
-		// Optional: Set tags (e.g., for lifecycle expiration)
-		Tagging:          aws.String("expire=true"),
+		Bucket:           aws.String(cfg_details.BUCKET_STUDENTS_FACULTIES),
+		CopySource:       aws.String(cfg_details.BUCKET_STUDENTS_FACULTIES + "/" + oldKey),
+		Key:              aws.String(newKey),
+		Tagging:          aws.String(tags),
 		TaggingDirective: s3types.TaggingDirectiveReplace,
 	})
 	if err != nil {
@@ -470,12 +471,8 @@ func DownloadFacultyFile(colId string, uId string, fName string, s3Client *s3.Cl
 		return "", err
 	}
 	enc := url.QueryEscape(presignedURL.URL)
-	body, _ := json.Marshal(FileResponse{URL: enc})
+	body, _ := json.Marshal(cfg_details.FileResponse{URL: enc})
 	return string(body), err
-}
-
-type FileResponse struct {
-	URL string `json:"url"`
 }
 
 func FetchFilesMetadata(colId string, uId string) (map[string]string, error) {

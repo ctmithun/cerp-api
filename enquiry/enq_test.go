@@ -116,6 +116,24 @@ func TestGetEnqV2(t *testing.T) {
 	})
 }
 
+func TestUpdateEnqStatusOnly(t *testing.T) {
+	var pgOnce sync.Once
+	pgOnce.Do(func() {
+		ctx := context.Background()
+		db, err := pgxpool.New(ctx, CONN_STR)
+		if err != nil {
+			err = fmt.Errorf("unable to create connection pool: %w", err)
+			return
+		}
+		err = UpdateEnqStatusOnly(db, ctx, "ni", "1066927174255902721", "Admitted", "Test-User")
+		db.Close()
+		if err != nil {
+			fmt.Println(err.Error())
+			t.Fail()
+		}
+	})
+}
+
 func TestAddEnqV2(t *testing.T) {
 
 	current_time := time.Now()

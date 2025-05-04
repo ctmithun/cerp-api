@@ -1,12 +1,15 @@
 package students
 
 import (
+	"bytes"
 	"cerpApi/cfg_details"
 	"cerpApi/iam"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"net/url"
 	"reflect"
 	"strconv"
 	"strings"
@@ -17,6 +20,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3Types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 type Student struct {
@@ -66,6 +71,9 @@ type Student struct {
 	TotalYearlyFees       string `json:"total_yearly_fees"`
 	AdmissionFees         string `json:"admission_fees"`
 	FeeReceipt            string `json:"fee_receipt"`
+	EnqId                 string `json:"eq_id"`
+	PhotoUrl              string `json:"photo_url"`
+	FeeReceiptUrl         string `json:"fee_receipt_url"`
 }
 
 type OnboardStudentBasicData struct {
@@ -203,8 +211,6 @@ func updateStudentRecord(college string, student *Student, PKKey string, SKKey i
 			exprVals[":"+k] = &types.AttributeValueMemberN{Value: strconv.FormatInt(fVal.Int(), 10)}
 		}
 	}
-	// exprVals[":pk"] = &types.AttributeValueMemberS{Value: PKKey}
-	// exprVals[":row"] = &types.AttributeValueMemberS{Value: strconv.Itoa(SKKey)}
 	exprVals[":uBy"] = &types.AttributeValueMemberS{Value: uBy}
 	exprVals[":ts"] = &types.AttributeValueMemberS{Value: strconv.FormatInt(time.Now().Unix(), 10)}
 	_, err := cfg_details.DynamoCfg.UpdateItem(
@@ -217,20 +223,7 @@ func updateStudentRecord(college string, student *Student, PKKey string, SKKey i
 			},
 			UpdateExpression:          aws.String(setExpr),
 			ExpressionAttributeValues: exprVals,
-			// map[string]types.AttributeValue{
-			// 	":Fees": &types.AttributeValueMemberN{Value: strconv.Itoa(student.Fees)},
-			// 	":Name": &types.AttributeValueMemberS{Value: student.Name},
-			// 	":Doj":  &types.AttributeValueMemberS{Value: student.Doj},
-			// 	":ts":   &types.AttributeValueMemberN{Value: strconv.FormatInt(time.Now().Unix(), 10)},
-			// 	":uBy":  &types.AttributeValueMemberS{Value: uBy},
-			// },
-			ExpressionAttributeNames: updateNames,
-			// map[string]string{
-			// 	"#val":  "value",
-			// 	"#Name": "Name",
-			// 	"#Doj":  "Doj",
-			// 	"#Fees": "Fees",
-			// },
+			ExpressionAttributeNames:  updateNames,
 		},
 	)
 	if err != nil {
@@ -325,24 +318,25 @@ func extractRowNum(sid string) (int, error) {
 	return strconv.Atoi(sArr[len(sArr)-1])
 }
 
-func DeactivateStudent(college string, student Student, uBy string) (bool, string) {
+func DeactivateStudent(s3Client *s3.Client, college string, student Student, uBy string) (bool, string) {
 	userId := cfg_details.GenerateUserId(getStudentIdKey(college, student))
 
 	if !strings.Contains(student.Id, userId) {
 		return false, cfg_details.INVALID_DATA
 	}
 	fmt.Printf("Deactivating the user %s by %s\n", student.Id, uBy)
-	err := iam.DeactivateUser(student.Id, uBy)
-	if err != nil {
-		fmt.Println("User deactivation failed in Auth0 - ", student.Id)
-		return false, cfg_details.AUTH0_UNAVAILABLE
-	}
+	// err := iam.DeactivateUser(student.Id, uBy)
+	// if err != nil {
+	// 	fmt.Println("User deactivation failed in Auth0 - ", student.Id)
+	// 	return false, cfg_details.AUTH0_UNAVAILABLE
+	// }
 	PKKey := student.Batch + "-" + student.Branch
 	SKKey, err := extractRowNum(student.Sid)
 	if err != nil {
 		fmt.Println("Error deactivating the student - ", student.Id)
 		return false, err.Error()
 	}
+	err = takeStudentBkupToS3(s3Client, college, PKKey, SKKey)
 	item, err := cfg_details.DynamoCfg.DeleteItem(context.TODO(), &dynamodb.DeleteItemInput{
 		TableName: aws.String(college + "_students"),
 		Key: map[string]types.AttributeValue{
@@ -357,8 +351,84 @@ func DeactivateStudent(college string, student Student, uBy string) (bool, strin
 	return true, ""
 }
 
+var tags = cfg_details.ArchiveTags()
+
+func takeStudentBkupToS3(s3Client *s3.Client, colId string, PKKey string, SKKey int) error {
+	getItemOutput, err := cfg_details.DynamoCfg.GetItem(context.Background(), &dynamodb.GetItemInput{
+		TableName: aws.String(colId + "_students"),
+		Key: map[string]types.AttributeValue{
+			"pk":      &types.AttributeValueMemberS{Value: PKKey},
+			"row_num": &types.AttributeValueMemberN{Value: strconv.Itoa(SKKey)},
+		},
+	})
+	if err != nil {
+		log.Printf("failed to get item: %v", err)
+		return err
+	}
+
+	if getItemOutput.Item == nil {
+		log.Printf("item not found")
+		return errors.New("item not found")
+	}
+
+	// 2. Convert to JSON
+	jsonData, err := json.MarshalIndent(cfg_details.UnmarshalItem(getItemOutput.Item), "", "  ")
+	if err != nil {
+		log.Printf("failed to marshal item: %v", err)
+	}
+	if err != nil {
+		log.Printf("failed to strconv Atoi on SKKey: %v", err)
+	}
+	s3Key := getS3Key(colId, "bkup/"+PKKey+"-"+strconv.Itoa(SKKey), "data_bkp_"+strconv.FormatInt(time.Now().Unix(), 10))
+	_, err = s3Client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket:      aws.String(cfg_details.BUCKET_STUDENTS_FACULTIES),
+		Key:         aws.String(s3Key),
+		Body:        bytes.NewReader(jsonData),
+		Tagging:     aws.String(tags),
+		ContentType: aws.String("application/json"),
+	})
+
+	if err != nil {
+		log.Printf("failed to upload to S3: %v", err)
+		return err
+	}
+	fmt.Printf("Item copied to s3://%s/%s\n", cfg_details.BUCKET_STUDENTS_FACULTIES, s3Key)
+	sourcePrefix := colId + "/" + PKKey + "-" + strconv.Itoa(SKKey) + "/"
+	destPrefix := colId + "/" + "bkup/" + PKKey + "-" + strconv.Itoa(SKKey) + "/"
+	listOutput, err := s3Client.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
+		Bucket: aws.String(cfg_details.BUCKET_STUDENTS_FACULTIES),
+		Prefix: aws.String(sourcePrefix),
+	})
+	if err != nil {
+		log.Printf("failed to list objects: %v", err)
+		return err
+	}
+
+	for _, obj := range listOutput.Contents {
+		srcKey := *obj.Key
+		destKey := strings.Replace(srcKey, sourcePrefix, destPrefix, 1)
+		_, err := s3Client.CopyObject(context.Background(), &s3.CopyObjectInput{
+			Bucket:           aws.String(cfg_details.BUCKET_STUDENTS_FACULTIES),
+			CopySource:       aws.String(cfg_details.BUCKET_STUDENTS_FACULTIES + "/" + srcKey),
+			Key:              aws.String(destKey),
+			Tagging:          aws.String(tags),
+			TaggingDirective: s3Types.TaggingDirectiveReplace,
+		})
+		if err != nil {
+			log.Printf("failed to copy %s: %v", srcKey, err)
+			continue
+		}
+		log.Printf("Copied %s → %s\n", srcKey, destKey)
+	}
+	return nil
+}
+
 func GetStudents(college string, course string, batch string, cs string) (types.AttributeValue, error) {
 	key, err := attributevalue.Marshal(college)
+	if err != nil {
+		log.Printf("Error matshaling the college %v\n", err)
+		return nil, err
+	}
 	sKey, err := attributevalue.Marshal(strings.ToLower(course) + "_" + strings.ToLower(batch) + "_" + strings.ToLower(cs))
 	if err != nil {
 		return nil, err
@@ -376,4 +446,23 @@ func GetStudents(college string, course string, batch string, cs string) (types.
 		return nil, nil
 	}
 	return item, err
+}
+
+func DownloadFile(colId string, sId string, fileKey string) (string, error) {
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(cfg_details.BUCKET_STUDENTS_FACULTIES),
+		Key:    aws.String(getS3Key(colId, sId, fileKey)),
+	}
+	presignedURL, err := cfg_details.Presigner.PresignGetObject(context.TODO(), input, s3.WithPresignExpires(5*time.Minute))
+	if err != nil {
+		log.Printf("Error in dowloading the requested file for s3 read operation - %s/%s err-%v\n", sId, fileKey, err)
+		return "", err
+	}
+	enc := url.QueryEscape(presignedURL.URL)
+	body, _ := json.Marshal(cfg_details.FileResponse{URL: enc})
+	return string(body), err
+}
+
+func getS3Key(colId string, sId string, fName string) string {
+	return colId + "/" + sId + "/" + fName
 }

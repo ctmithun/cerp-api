@@ -160,7 +160,7 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 	fmt.Printf("Found roles %s\n", roles)
 	if request.Resource == "/admission/admit" && request.HTTPMethod == http.MethodPost {
 		if strings.Contains(roles, ROLE_COUNSELLOR) || strings.Contains(roles, ROLE_ADMIN) {
-			sId, err := handleAdmission(request, userId)
+			sId, err := handleAdmission(ctx, request, userId)
 			if err != nil {
 				return respondError(err.Error())
 			}
@@ -412,11 +412,23 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 			if err != nil || studentOnboardForm.Id == "" {
 				return AUTH_504, err
 			}
-			sId, res := students.DeactivateStudent(colId, studentOnboardForm, userId)
+			sId, res := students.DeactivateStudent(s3Client, colId, studentOnboardForm, userId)
 			if !sId && res != "" {
 				return respondError(res)
 			}
 			return respondData(res, err)
+		} else if request.HTTPMethod == http.MethodGet && request.Resource == "/metadata/student/downloadFile" {
+			colId := request.QueryStringParameters["college_id"]
+			fId, err := url.PathUnescape(request.QueryStringParameters["fId"])
+			if err != nil {
+				respondData("", err)
+			}
+			sId, err := url.PathUnescape(request.QueryStringParameters["sId"])
+			if err != nil {
+				respondData("", err)
+			}
+			url, err := students.DownloadFile(colId, sId, fId)
+			return respondData(url, err)
 		} else if request.HTTPMethod == http.MethodGet && request.Resource == "/metadata/student/manage" {
 			colId := request.QueryStringParameters["college_id"]
 			batch := request.QueryStringParameters["batch"]
@@ -433,11 +445,23 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 			}
 			res, err := json.Marshal(students.GetStudentsData(colId, batch, stream))
 			return respondData(string(res), err)
-		} else if request.HTTPMethod == http.MethodGet && request.Resource == "/v2/metadata/student/update" {
+		} else if request.HTTPMethod == http.MethodPut && request.Resource == "/v2/metadata/student/update" {
 			res, err := handleStudentDataUpdate(&request, userId)
 			return respondData(res, err)
+		} else if request.HTTPMethod == http.MethodPut && request.Resource == "/metadata/student/usnUpdate" {
+			colId := request.QueryStringParameters["college_id"]
+			var studentsRollUsnMap map[string]string
+			err = json.Unmarshal([]byte(request.Body), &studentsRollUsnMap)
+			if err != nil {
+				log.Printf("Error unmarshalling the req body %v\n", err)
+				return respondData("", err)
+			}
+			res, err := students.UpdateStudentRegNumsInBulk(colId, studentsRollUsnMap, userId)
+			if err != nil {
+				return respondData("", err)
+			}
+			return respondData(res, nil)
 		}
-
 	}
 	return AUTH_404, errors.New("Resource not found")
 }
@@ -506,7 +530,9 @@ func handleFacultyMetadataUpload(request *events.APIGatewayProxyRequest, uBy str
 	}
 	mr, err := awslambda.NewReaderMultipart(*request)
 	formMap := make(map[string]string)
+	fileProps := make(map[string]string)
 	formFilesMap := make(map[string][]byte)
+	fileKey := ""
 	for {
 		part, err := mr.NextPart()
 		if err == io.EOF {
@@ -518,10 +544,12 @@ func handleFacultyMetadataUpload(request *events.APIGatewayProxyRequest, uBy str
 			return err.Error(), err
 		}
 		content, err := io.ReadAll(part)
-
+		log.Printf("part.FormName %s\n", part.FormName())
 		// Skip non-file fields
 		if part.FileName() == "" {
-			formMap[part.FormName()] = string(content)
+			if part.FormName() == "comments" {
+				fileProps["comments"] = string(content)
+			}
 			continue
 		}
 		if len(content) <= 0 {
@@ -530,20 +558,19 @@ func handleFacultyMetadataUpload(request *events.APIGatewayProxyRequest, uBy str
 		}
 		arr := strings.Split(part.FileName(), ".")
 		fType := arr[len(arr)-1]
-		fileKey := part.FormName() + "." + fType
+		fileKey = part.FormName() + "." + fType
 		log.Printf("File Key is %s\n", fileKey)
 		formFilesMap[fileKey] = content
-		fileProps := make(map[string]string)
 		fileProps["type"] = fType
 		fileProps["key"] = fileKey
 		fileProps["uploaded"] = "true"
-		strFileProps, err := json.Marshal(fileProps)
 		if err != nil {
 			log.Printf("Error marshalling file properties %v\n", err)
 			return err.Error(), err
 		}
-		formMap[fileKey] = string(strFileProps)
 	}
+	strFileProps, err := json.Marshal(fileProps)
+	formMap[fileKey] = string(strFileProps)
 	if err != nil {
 		return err.Error(), err
 	}
@@ -645,7 +672,7 @@ func handleStudentDataUpdate(request *events.APIGatewayProxyRequest, uBy string)
 	return sId, nil
 }
 
-func handleAdmission(request events.APIGatewayProxyRequest, uBy string) (string, error) {
+func handleAdmission(ctx context.Context, request events.APIGatewayProxyRequest, uBy string) (string, error) {
 	colId := request.QueryStringParameters["college_id"]
 	formFilesMap, formMap, err := processStudentData(colId, &request)
 	if err != nil {
@@ -666,6 +693,9 @@ func handleAdmission(request events.APIGatewayProxyRequest, uBy string) (string,
 	sId, err := students.OnboardStudentV2(colId, &student, uBy)
 	if err != nil {
 		return err.Error(), err
+	}
+	if student.EnqId != "" {
+		enquiry.UpdateEnqStatusOnly(pgInstance.db, ctx, colId, student.EnqId, "Admitted", uBy)
 	}
 	for k, v := range formFilesMap {
 		err = uploadToS3(k, v, sId, colId)

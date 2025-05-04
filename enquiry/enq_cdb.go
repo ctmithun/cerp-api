@@ -165,6 +165,16 @@ func UpdateEnqV2(con *pgxpool.Pool, ctx context.Context, formData FormData, colI
 	return err
 }
 
+func UpdateEnqStatusOnly(con *pgxpool.Pool, ctx context.Context, colId string, enqId string, status string, uBy string) error {
+	tableName := getEnqTableName(colId)
+	query := `Update ` + tableName + ` set status=$1, u_by=$2 WHERE id = $3`
+	_, err := con.Exec(ctx, query, status, uBy, enqId)
+	if err != nil {
+		fmt.Println("Error deleting the Eq table - " + err.Error())
+	}
+	return err
+}
+
 func AddEnqV2(con *pgxpool.Pool, ctx context.Context, eqForm FormData, colId string, uBy string) (string, error) {
 	tableName := getEnqTableName(colId)
 	query := `INSERT INTO ` + tableName + ` ("name", "course", "location", "councillor_id", "councillor_name", "mobile", "parent_mobile", 
