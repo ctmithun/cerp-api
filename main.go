@@ -9,6 +9,7 @@ import (
 	jwtVerifier "cerpApi/jwt"
 	"cerpApi/onboard_data"
 	"cerpApi/students"
+	"cerpApi/uv"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -66,6 +67,12 @@ const (
 
 type postgres struct {
 	db *pgxpool.Pool
+}
+
+type UploadRequest struct {
+	Filename string `json:"filename"`
+	MimeType string `json:"mimeType"`
+	Data     string `json:"data"` // base64 encoded
 }
 
 var (
@@ -157,7 +164,6 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 	if roles == "" {
 		return AUTH_403, errors.New("Invalid Token!!")
 	}
-	fmt.Printf("Found roles %s\n", roles)
 	if request.Resource == "/admission/admit" && request.HTTPMethod == http.MethodPost {
 		if strings.Contains(roles, ROLE_COUNSELLOR) || strings.Contains(roles, ROLE_ADMIN) {
 			sId, err := handleAdmission(ctx, request, userId)
@@ -190,7 +196,9 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 			batch := request.QueryStringParameters["batch"]
 			subject := request.QueryStringParameters["subject"]
 			cs := request.QueryStringParameters["class_section"]
-			res := attendance.GetAttendanceReport(colId, course, batch, subject, cs)
+			from := request.QueryStringParameters["from"]
+			to := request.QueryStringParameters["to"]
+			res := attendance.GetAttendanceReport(colId, course, batch, subject, cs, from, to)
 			if res == "" {
 				return respondData("Attendance Export Data Unavailable!", nil)
 			}
@@ -249,6 +257,43 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 			return respondData("Updated at - "+strconv.FormatInt(attendanceForm.Ts, 10), err)
 		}
 		return AUTH_500, errors.New("no roles set")
+	} else if request.HTTPMethod == http.MethodGet && request.Resource == "/profile" {
+		colId := request.QueryStringParameters["college_id"]
+		return respondData(faculty.GetFacultiesData(colId, userId), err)
+	} else if request.HTTPMethod == http.MethodPost && request.Resource == "/profile" {
+		colId := request.QueryStringParameters["college_id"]
+		var facultyCreateForm faculty.Faculty
+		err = json.Unmarshal([]byte(request.Body), &facultyCreateForm)
+		if err != nil {
+			return AUTH_504, err
+		}
+		isUpdated, res := faculty.ProfileUpdate(pgInstance.db, s3Client, colId, facultyCreateForm, userId)
+		if !isUpdated {
+			return respondError(res)
+		}
+		return respondData(res, err)
+	} else if request.HTTPMethod == http.MethodPost && request.Resource == "/profile-photo" {
+		colId := request.QueryStringParameters["college_id"]
+		var uploadReq UploadRequest
+		err := json.Unmarshal([]byte(request.Body), &uploadReq)
+		if err != nil {
+			return respondError("400")
+		}
+		if uploadReq.MimeType != "image/png" && uploadReq.MimeType != "image/jpeg" {
+			return events.APIGatewayProxyResponse{StatusCode: 400, Body: "Unsupported image type"}, nil
+		}
+		imageData, err := base64.StdEncoding.DecodeString(uploadReq.Data)
+		if err != nil {
+			log.Printf("Error decoding the image %v\n", err)
+			return respondError(err.Error())
+		}
+		log.Println("Detected MIME type:", uploadReq.MimeType)
+		key, err := faculty.UploadImage(s3Client, colId, imageData, uploadReq.MimeType)
+		return respondData(key, err)
+	} else if request.HTTPMethod == http.MethodGet && request.Resource == "/profile-photo" {
+		colId := request.QueryStringParameters["college_id"]
+		key := request.QueryStringParameters["key"]
+		return respondData(faculty.GetProfilePic(colId, key))
 	} else if request.Resource == "/metadata/faculty/subjects" {
 		if strings.Contains(roles, "faculty") || strings.Contains(roles, "admin") {
 			colId := request.QueryStringParameters["college_id"]
@@ -258,130 +303,8 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 	} else if strings.Contains(request.Resource, "/enq/") && (strings.Contains(roles, ROLE_COUNSELLOR) || strings.Contains(roles, ROLE_ADMIN)) {
 		userName := claims[cfg_details.ALLOWED_URL+"name"].(string)
 		return handleEnquiry(roles, request, userId, ctx, userName)
-	} else if strings.Contains(roles, "admin") {
-		if request.Resource == "/metadata/update" {
-			fmt.Printf("Inside the /metadata/update")
-			_type := request.QueryStringParameters["type"]
-			colId := request.QueryStringParameters["college_id"]
-			course := strings.ToLower(request.QueryStringParameters["class"])
-			batch := request.QueryStringParameters["batch"]
-			if _type == "subjects" {
-				err, ts := OnboardSubjects(colId, course, batch, userId, []byte(request.Body))
-				if err != nil {
-					return AUTH_500, err
-				}
-				return respondData("Updated at - "+strconv.FormatInt(ts, 10), err)
-			} else if _type == "students" {
-				cs := request.QueryStringParameters["class_section"]
-				err, ts := onboardStudentsAttendance(colId, course, batch, userId, cs, request.Body)
-				if err != nil {
-					return AUTH_500, err
-				}
-				return respondData("Updated at - "+strconv.FormatInt(ts, 10), err)
-			} else if _type == "s2s" {
-				cs := request.QueryStringParameters["class_section"]
-				res, err := onboard_data.OnboardS2S(colId, course, batch, cs, userId, []byte(request.Body))
-				if err != nil {
-					return respondError("Update Failed - " + err.Error())
-				}
-				return respondData("Updated at - "+res, err)
-			}
-		} else if request.Resource == "/metadata/getStudents" {
-			colId := request.QueryStringParameters["college_id"]
-			course := strings.ToLower(request.QueryStringParameters["class"])
-			batch := request.QueryStringParameters["batch"]
-			cs := request.QueryStringParameters["class_section"]
-			students, err := getStudents(colId, course, batch, cs)
-			if err != nil {
-				return AUTH_500, err
-			}
-			if students == nil {
-				return respondData("", nil)
-			}
-			fmt.Println(students)
-			res, err := json.Marshal(students)
-			if err != nil {
-				return AUTH_500, err
-			}
-			return respondData(string(res), err)
-		} else if request.Resource == "/metadata/s2s" && request.HTTPMethod == http.MethodGet {
-			colId := request.QueryStringParameters["college_id"]
-			course := strings.ToLower(request.QueryStringParameters["class"])
-			batch := request.QueryStringParameters["batch"]
-			cs := request.QueryStringParameters["class_section"]
-			if err != nil {
-				return respondError(err.Error())
-			}
-			res, err := onboard_data.GetS2S(colId, course, batch, cs)
-			if err != nil {
-				return respondError(err.Error())
-			}
-			return respondData(res, err)
-		} else if request.HTTPMethod == http.MethodPost && request.Resource == "/metadata/faculty/create" {
-			colId := request.QueryStringParameters["college_id"]
-			var facultyCreateForm faculty.Faculty
-			err = json.Unmarshal([]byte(request.Body), &facultyCreateForm)
-			if err != nil {
-				return AUTH_504, err
-			}
-			isCreated, id := faculty.CreateFacultyMeta(colId, facultyCreateForm, userId)
-			if !isCreated {
-				return AUTH_504, err
-			}
-			return respondData(string(id), err)
-		} else if request.HTTPMethod == http.MethodPost && request.Resource == "/metadata/faculty/update" {
-			colId := request.QueryStringParameters["college_id"]
-			isRoleUpdate, _ := strconv.ParseBool(request.QueryStringParameters["lore"])
-			var facultyCreateForm faculty.Faculty
-			err = json.Unmarshal([]byte(request.Body), &facultyCreateForm)
-			if err != nil {
-				return AUTH_504, err
-			}
-			isUpdated, res := faculty.ModifyFacultyData(colId, facultyCreateForm, userId, isRoleUpdate)
-			if !isUpdated {
-				return respondError(res)
-			}
-			return respondData(res, err)
-		} else if request.HTTPMethod == http.MethodPost && request.Resource == "/metadata/faculty/upload" {
-			return respondData(handleFacultyMetadataUpload(&request, userId))
-		} else if request.HTTPMethod == http.MethodGet && request.Resource == "/metadata/faculty/files" {
-			return respondData(handleFacultyMetadataDownload(&request))
-		} else if request.HTTPMethod == http.MethodDelete && request.Resource == "/metadata/faculty/files" {
-			return respondData(handleFacultyMetadataRemove(&request, userId))
-		} else if request.HTTPMethod == http.MethodGet && request.Resource == "/metadata/faculty/filedata" {
-			return respondData(handleFacultyMetadataFileData(&request))
-		} else if request.HTTPMethod == http.MethodGet && request.Resource == "/metadata/faculty/manage" {
-			colId := request.QueryStringParameters["college_id"]
-			fId, err := url.PathUnescape(request.QueryStringParameters["fId"])
-			if err != nil {
-				return AUTH_400, err
-			}
-			return respondData(faculty.GetFacultiesData(colId, fId), err)
-		} else if request.HTTPMethod == http.MethodDelete && request.Resource == "/metadata/faculty/delete" {
-			colId := request.QueryStringParameters["college_id"]
-			var facultyCreateForm faculty.Faculty
-			err = json.Unmarshal([]byte(request.Body), &facultyCreateForm)
-			if err != nil {
-				return AUTH_504, err
-			}
-			isDeactivated, errMessage := faculty.DeleteFaculty(colId, facultyCreateForm, userId)
-			if !isDeactivated {
-				return respondError(errMessage)
-			}
-			return respondData(errMessage, err)
-		} else if request.HTTPMethod == http.MethodDelete && request.Resource == "/metadata/faculty/deactivate" {
-			colId := request.QueryStringParameters["college_id"]
-			var facultyCreateForm faculty.Faculty
-			err = json.Unmarshal([]byte(request.Body), &facultyCreateForm)
-			if err != nil {
-				return AUTH_504, err
-			}
-			isDeactivated, errMessage := faculty.DeactivateFaculty(colId, facultyCreateForm, userId)
-			if !isDeactivated {
-				return respondError(errMessage)
-			}
-			return respondData(errMessage, err)
-		} else if request.HTTPMethod == http.MethodPost && request.Resource == "/metadata/student/create" {
+	} else if strings.Contains(request.Resource, "/metadata/student/") && (strings.Contains(roles, ROLE_ADMIN)) {
+		if request.HTTPMethod == http.MethodPost && request.Resource == "/metadata/student/create" {
 			colId := request.QueryStringParameters["college_id"]
 			var studentOnboardForm students.Student
 			err = json.Unmarshal([]byte(request.Body), &studentOnboardForm)
@@ -445,6 +368,22 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 			}
 			res, err := json.Marshal(students.GetStudentsData(colId, batch, stream))
 			return respondData(string(res), err)
+		} else if request.HTTPMethod == http.MethodGet && request.Resource == "/v2/metadata/student/manage" {
+			colId := request.QueryStringParameters["college_id"]
+			batch := request.QueryStringParameters["batch"]
+			stream := request.QueryStringParameters["class"]
+			subStreams := strings.Split(request.QueryStringParameters["sub_classes"], ",")
+			if len(subStreams) > 0 && subStreams[0] != "" {
+				mRes := make([]students.StudentRecord, 0)
+				for i := 0; i < len(subStreams); i++ {
+					res := students.GetStudentsDataV2(colId, batch, stream+"-"+subStreams[i])
+					mRes = append(mRes, res...)
+				}
+				res, err := json.Marshal(mRes)
+				return respondData(string(res), err)
+			}
+			res, err := json.Marshal(students.GetStudentsDataV2(colId, batch, stream))
+			return respondData(string(res), err)
 		} else if request.HTTPMethod == http.MethodPut && request.Resource == "/v2/metadata/student/update" {
 			res, err := handleStudentDataUpdate(&request, userId)
 			return respondData(res, err)
@@ -461,9 +400,292 @@ func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 				return respondData("", err)
 			}
 			return respondData(res, nil)
+		} else if request.HTTPMethod == http.MethodPost && request.Resource == "/metadata/student/upload" {
+			return respondData(handleFacultyMetadataUpload(&request, userId))
+		} else if request.HTTPMethod == http.MethodGet && request.Resource == "/metadata/student/files" {
+			return respondData(handleFacultyMetadataDownload(&request))
+		} else if request.HTTPMethod == http.MethodDelete && request.Resource == "/metadata/student/files" {
+			return respondData(handleFacultyMetadataRemove(&request, userId))
+		} else if request.HTTPMethod == http.MethodGet && request.Resource == "/metadata/student/filedata" {
+			return respondData(handleFacultyMetadataFileData(&request))
+		} else if request.HTTPMethod == http.MethodGet && request.Resource == "/metadata/student/vault/list" {
+			colId := request.QueryStringParameters["college_id"]
+			studentsInput := cfg_details.ConvertSingleQuoteString(request.QueryStringParameters["students"])
+			return respondData(students.GetStudentsVault(pgInstance.db, colId, studentsInput))
+		} else if request.HTTPMethod == http.MethodGet && request.Resource == "/metadata/student/vault/student" {
+			colId := request.QueryStringParameters["college_id"]
+			sid := request.QueryStringParameters["sid"]
+			return respondData(students.GetStudentVault(pgInstance.db, colId, sid))
+		} else if request.HTTPMethod == http.MethodPost && request.Resource == "/metadata/student/vault/update" {
+			return respondData(handleStudentVaultUpdate(&request, userId))
+		} else if request.HTTPMethod == http.MethodPost && request.Resource == "/metadata/student/vault/otp" {
+			return respondData(handleStudentVaultOtp(&request, userId))
+		}
+	} else if strings.Contains(roles, "admin") {
+		if request.Resource == "/metadata/update" {
+			fmt.Printf("Inside the /metadata/update")
+			_type := request.QueryStringParameters["type"]
+			colId := request.QueryStringParameters["college_id"]
+			course := strings.ToLower(request.QueryStringParameters["class"])
+			batch := request.QueryStringParameters["batch"]
+			if _type == "subjects" {
+				err, ts := OnboardSubjects(colId, course, batch, userId, []byte(request.Body))
+				if err != nil {
+					return AUTH_500, err
+				}
+				return respondData("Updated at - "+strconv.FormatInt(ts, 10), err)
+			} else if _type == "students" {
+				cs := request.QueryStringParameters["class_section"]
+				err, ts := onboardStudentsAttendance(colId, course, batch, userId, cs, request.Body)
+				if err != nil {
+					return AUTH_500, err
+				}
+				return respondData("Updated at - "+strconv.FormatInt(ts, 10), err)
+			} else if _type == "s2s" {
+				cs := request.QueryStringParameters["class_section"]
+				res, err := onboard_data.OnboardS2S(colId, course, batch, cs, userId, []byte(request.Body))
+				if err != nil {
+					return respondError("Update Failed - " + err.Error())
+				}
+				return respondData("Updated at - "+res, err)
+			} else if _type == "vault-meta" {
+				res, err := onboard_data.OnboardVaultMeta(colId, course, userId, []byte(request.Body))
+				if err != nil {
+					return respondError("Update Failed - " + err.Error())
+				}
+				return respondData("Updated at - "+res, err)
+			}
+		} else if request.Resource == "/metadata/fetch" && request.HTTPMethod == http.MethodGet {
+			return respondData(handleMetadataFetch(&request))
+		} else if request.Resource == "/metadata/getStudents" {
+			colId := request.QueryStringParameters["college_id"]
+			course := strings.ToLower(request.QueryStringParameters["class"])
+			batch := request.QueryStringParameters["batch"]
+			cs := request.QueryStringParameters["class_section"]
+			students, err := getStudents(colId, course, batch, cs)
+			if err != nil {
+				return AUTH_500, err
+			}
+			if students == nil {
+				return respondData("", nil)
+			}
+			fmt.Println(students)
+			res, err := json.Marshal(students)
+			if err != nil {
+				return AUTH_500, err
+			}
+			return respondData(string(res), err)
+		} else if request.Resource == "/metadata/s2s" && request.HTTPMethod == http.MethodGet {
+			colId := request.QueryStringParameters["college_id"]
+			course := strings.ToLower(request.QueryStringParameters["class"])
+			batch := request.QueryStringParameters["batch"]
+			cs := request.QueryStringParameters["class_section"]
+			if err != nil {
+				return respondError(err.Error())
+			}
+			res, err := onboard_data.GetS2S(colId, course, batch, cs)
+			if err != nil {
+				return respondError(err.Error())
+			}
+			return respondData(res, err)
+		} else if request.HTTPMethod == http.MethodPost && request.Resource == "/metadata/faculty/create" {
+			colId := request.QueryStringParameters["college_id"]
+			var facultyCreateForm faculty.Faculty
+			err = json.Unmarshal([]byte(request.Body), &facultyCreateForm)
+			if err != nil {
+				return AUTH_504, err
+			}
+			isCreated, id := faculty.CreateFacultyMeta(pgInstance.db, colId, facultyCreateForm, userId)
+			faculty.UpdateProfileTag(s3Client, colId, facultyCreateForm.Photo)
+			if !isCreated {
+				return AUTH_504, err
+			}
+			return respondData(string(id), err)
+		} else if request.HTTPMethod == http.MethodPost && request.Resource == "/metadata/faculty/update" {
+			colId := request.QueryStringParameters["college_id"]
+			isRoleUpdate, _ := strconv.ParseBool(request.QueryStringParameters["lore"])
+			var facultyCreateForm faculty.Faculty
+			err = json.Unmarshal([]byte(request.Body), &facultyCreateForm)
+			if err != nil {
+				return AUTH_504, err
+			}
+			isUpdated, res := faculty.ModifyFacultyData(pgInstance.db, s3Client, colId, facultyCreateForm, userId, isRoleUpdate)
+			if !isUpdated {
+				return respondError(res)
+			}
+			return respondData(res, err)
+		} else if request.HTTPMethod == http.MethodPost && request.Resource == "/metadata/faculty/upload" {
+			return respondData(handleFacultyMetadataUpload(&request, userId))
+		} else if request.HTTPMethod == http.MethodGet && request.Resource == "/metadata/faculty/files" {
+			return respondData(handleFacultyMetadataDownload(&request))
+		} else if request.HTTPMethod == http.MethodDelete && request.Resource == "/metadata/faculty/files" {
+			return respondData(handleFacultyMetadataRemove(&request, userId))
+		} else if request.HTTPMethod == http.MethodGet && request.Resource == "/metadata/faculty/filedata" {
+			return respondData(handleFacultyMetadataFileData(&request))
+		} else if request.HTTPMethod == http.MethodGet && request.Resource == "/metadata/faculty/manage" {
+			colId := request.QueryStringParameters["college_id"]
+			fId, err := url.PathUnescape(request.QueryStringParameters["fId"])
+			if err != nil {
+				return AUTH_400, err
+			}
+			return respondData(faculty.GetFacultiesData(colId, fId), err)
+		} else if request.HTTPMethod == http.MethodPost && request.Resource == "/metadata/faculty/export" {
+			colId := request.QueryStringParameters["college_id"]
+			var fIds []string
+			err := json.Unmarshal([]byte(request.Body), &fIds)
+			if err != nil {
+				return respondError(cfg_details.INVALID_DATA)
+			}
+			return respondData(faculty.ExportForIdGeneration(s3Client, colId, fIds))
+		} else if request.HTTPMethod == http.MethodDelete && request.Resource == "/metadata/faculty/delete" {
+			colId := request.QueryStringParameters["college_id"]
+			var facultyCreateForm faculty.Faculty
+			err = json.Unmarshal([]byte(request.Body), &facultyCreateForm)
+			if err != nil {
+				return AUTH_504, err
+			}
+			isDeactivated, errMessage := faculty.DeleteFaculty(s3Client, colId, facultyCreateForm, userId)
+			if !isDeactivated {
+				return respondError(errMessage)
+			}
+			return respondData(errMessage, err)
+		} else if request.HTTPMethod == http.MethodDelete && request.Resource == "/metadata/faculty/deactivate" {
+			colId := request.QueryStringParameters["college_id"]
+			var facultyCreateForm faculty.Faculty
+			err = json.Unmarshal([]byte(request.Body), &facultyCreateForm)
+			if err != nil {
+				return AUTH_504, err
+			}
+			isDeactivated, errMessage := faculty.DeactivateFaculty(colId, facultyCreateForm, userId)
+			if !isDeactivated {
+				return respondError(errMessage)
+			}
+			return respondData(errMessage, err)
+		} else if request.HTTPMethod == http.MethodPost && request.Resource == "/metadata/faculty/profile" {
+			colId := request.QueryStringParameters["college_id"]
+			var uploadReq UploadRequest
+			err := json.Unmarshal([]byte(request.Body), &uploadReq)
+			if err != nil {
+				return respondError("400")
+			}
+			if uploadReq.MimeType != "image/png" && uploadReq.MimeType != "image/jpeg" {
+				return events.APIGatewayProxyResponse{StatusCode: 400, Body: "Unsupported image type"}, nil
+			}
+			imageData, err := base64.StdEncoding.DecodeString(uploadReq.Data)
+			if err != nil {
+				log.Printf("Error decoding the image %v\n", err)
+				return respondError(err.Error())
+			}
+			log.Println("Detected MIME type:", uploadReq.MimeType)
+			key, err := faculty.UploadImage(s3Client, colId, imageData, uploadReq.MimeType)
+			return respondData(key, err)
+		} else if request.HTTPMethod == http.MethodGet && request.Resource == "/metadata/faculty/profile" {
+			colId := request.QueryStringParameters["college_id"]
+			key := request.QueryStringParameters["key"]
+			url, err := faculty.GetProfilePic(colId, key)
+			return respondData(url, err)
+		}
+	} else if strings.HasPrefix(request.Resource, "/uv") {
+		if strings.Contains(roles, ROLE_ADMIN) || strings.Contains(roles, ROLE_COUNSELLOR) {
+			if request.HTTPMethod == http.MethodPost && request.Resource == "/uv/create" {
+				colId := request.QueryStringParameters["college_id"]
+				course := request.QueryStringParameters["class"]
+				batch := request.QueryStringParameters["batch"]
+				docType := request.QueryStringParameters["doc_type"]
+				var studentsList []string
+				err = json.Unmarshal([]byte(request.Body), &studentsList)
+				if err != nil {
+					log.Printf("Error parsing the request body in handleStudentVaultUpdate - %v\n", err)
+					return respondError(err.Error())
+				}
+				err = uv.OnboardUvDocs(colId, strings.ToLower(batch+"_"+course), docType, studentsList, userId)
+				if err != nil {
+					return AUTH_500, err
+				}
+				return respondData("Collected", nil)
+			} else if request.HTTPMethod == http.MethodGet && request.Resource == "/uv/list" {
+				colId := request.QueryStringParameters["college_id"]
+				course := request.QueryStringParameters["class"]
+				batch := request.QueryStringParameters["batch"]
+				docType := request.QueryStringParameters["doc_type"]
+				result, err := uv.ListUvDocsStudents(colId, strings.ToLower(batch+"_"+course), docType)
+				if err != nil {
+					log.Printf("Error listing UV docs - %v\n", err)
+					return respondError(err.Error())
+				}
+				resJson, err := json.Marshal(result)
+				if err != nil {
+					return respondError("Failed to marshal response")
+				}
+				return respondData(string(resJson), nil)
+			} else if request.HTTPMethod == http.MethodPost && request.Resource == "/uv/student/collect" {
+				colId := request.QueryStringParameters["college_id"]
+				course := request.QueryStringParameters["class"]
+				batch := request.QueryStringParameters["batch"]
+				docType := request.QueryStringParameters["doc_type"]
+				var coreData map[string]string
+				err = json.Unmarshal([]byte(request.Body), &coreData)
+				if err != nil {
+					log.Printf("Error parsing the request body in handleStudentVaultUpdate - %v\n", err)
+					return respondError(err.Error())
+				}
+				if course == "" || batch == "" || docType == "" || colId == "" {
+					log.Printf("Invalid parameters for UV student collect - colId: %s, course:	%s, batch: %s, docType: %s \n", colId, course, batch, docType)
+					return AUTH_400, errors.New("all fields are required")
+				}
+				if coreData == nil && len(coreData) == 0 && (coreData["sid"] == "" || coreData["otp"] == "") || coreData["description"] == "" {
+					log.Printf("Invalid parameters for UV student collect - sid: %s, otp: %s\n", coreData["sid"], coreData["otp"])
+					return AUTH_400, errors.New("all fields are required")
+				}
+				return respondData("Document collected successfully", uv.CollectDocument(colId, strings.ToLower(batch+"_"+course), docType, coreData["sid"], coreData["description"], coreData["otp"], userId))
+			}
 		}
 	}
-	return AUTH_404, errors.New("Resource not found")
+	return AUTH_404, errors.New("resource not found")
+}
+
+func handleStudentVaultUpdate(request *events.APIGatewayProxyRequest, uBy string) (string, error) {
+	colId := request.QueryStringParameters["college_id"]
+	otp := request.QueryStringParameters["otp"]
+	var studentVaultDocs students.StudentDocs
+	err := json.Unmarshal([]byte(request.Body), &studentVaultDocs)
+	if err != nil {
+		log.Printf("Error parsing the request body in handleStudentVaultUpdate - %v\n", studentVaultDocs)
+	}
+	err = students.SaveVault(pgInstance.db, colId, uBy, studentVaultDocs, otp)
+	if err != nil {
+		if strings.HasPrefix(err.Error(), "Otp is invalid") {
+			return err.Error(), err
+		}
+		return "Failed saving the data", err
+	}
+	return "", nil
+}
+
+func handleStudentVaultOtp(request *events.APIGatewayProxyRequest, uBy string) (string, error) {
+	colId := request.QueryStringParameters["college_id"]
+	var studentVaultDocs students.StudentDocs
+	err := json.Unmarshal([]byte(request.Body), &studentVaultDocs)
+	if err != nil {
+		log.Printf("Error parsing the request body in handleStudentVaultUpdate - %v\n", studentVaultDocs)
+	}
+	err = students.GenerateOtp(colId, studentVaultDocs, uBy)
+	if err != nil {
+		return "Failed saving the data", err
+	}
+	return "success", nil
+}
+
+func handleMetadataFetch(request *events.APIGatewayProxyRequest) (string, error) {
+	_type := request.QueryStringParameters["type"]
+	colId := request.QueryStringParameters["college_id"]
+	course := strings.ToLower(request.QueryStringParameters["class"])
+	switch _type {
+	case "vault-meta":
+		return onboard_data.GetVaultMeta(colId, course)
+	}
+
+	return "", nil
 }
 
 func handleFacultyMetadataFileData(req *events.APIGatewayProxyRequest) (string, error) {
@@ -831,8 +1053,10 @@ func respondError(res string) (events.APIGatewayProxyResponse, error) {
 		return AUTH_403, errors.New(res)
 	case "404":
 		return AUTH_404, errors.New(res)
+	case "400":
+		return AUTH_400, errors.New("invalid input")
 	default:
-		return AUTH_504, errors.New(res)
+		return getProxyResponse(res, 500), errors.New(res)
 	}
 }
 

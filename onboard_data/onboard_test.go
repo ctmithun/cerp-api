@@ -1,6 +1,7 @@
 package onboard_data
 
 import (
+	"encoding/json"
 	"log"
 	"testing"
 )
@@ -61,6 +62,40 @@ func TestGetS2SPerSub2NoData(t *testing.T) {
 	}
 	if res == nil {
 		log.Printf("No data found")
+	}
+	log.Println(res)
+}
+
+func TestOnboardVaultMeta(t *testing.T) {
+	data := make([]map[string]string, 0)
+	data = append(data, map[string]string{
+		"name":   "Aadhar card",
+		"id":     "aadharcard",
+		"desc":   "Collect 1 copy of AADHAR",
+		"single": "true",
+	})
+	data = append(data, map[string]string{
+		"name":   "Other",
+		"id":     "other",
+		"desc":   "Any other document",
+		"single": "false",
+	})
+	bytesData, err := json.Marshal(data)
+	if err != nil {
+		log.Panicf("Error in marshaling the data - %v\n", err)
+		t.Fail()
+	}
+	_, err = OnboardVaultMeta("ni", "bca", "test", bytesData)
+	if err != nil {
+		log.Printf("Failed onboarding the vault metadata %v\n", err)
+		t.Fail()
+	}
+}
+
+func TestGetVaultMeta(t *testing.T) {
+	res, err := GetVaultMeta("ni", "BCA")
+	if err != nil {
+		t.Fail()
 	}
 	log.Println(res)
 }

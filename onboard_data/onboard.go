@@ -4,15 +4,18 @@ import (
 	"cerpApi/cfg_details"
 	"context"
 	"encoding/json"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"log"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
+
+const VAULT_META = "vault-meta"
 
 type onboardS2SData struct {
 	PK      string            `dynamodbav:"key"`
@@ -28,6 +31,10 @@ func GetS2SPerSub(colId string, course string, batch string, cs string, sub stri
 		return nil, err
 	}
 	sKey, err := attributevalue.Marshal(sub)
+	if err != nil {
+		log.Printf("Error in GetS2SPerSub while marshaling - %v\n", err)
+		return nil, err
+	}
 	ck := map[string]types.AttributeValue{
 		"key":  key,
 		"skey": sKey,
@@ -99,6 +106,82 @@ func OnboardS2S(colId string, course string, batch string, cs string, uBy string
 	return batchWrite(colId, course, batch, cs, uBy, reqBodyParsed)
 }
 
+func OnboardVaultMeta(colId string, course string, uBy string, reqBody []byte) (string, error) {
+	var writeRequests []types.WriteRequest
+	// reqBodyParsed := make(map[string]string)
+	// err := json.Unmarshal(reqBody, &reqBodyParsed)
+	// if err != nil {
+	// 	log.Printf("OnboardVaultMeta: unmarshal reqBody err: %v", err)
+	// 	return "", err
+	// }
+	ts := time.Now().Unix()
+	val := map[string]string{VAULT_META: string(reqBody)}
+	dataItem := onboardS2SData{
+		PK:      cfg_details.GetPk(colId, course),
+		SK:      VAULT_META,
+		Value:   val,
+		Ts:      ts,
+		Updater: uBy,
+	}
+	item, err := attributevalue.MarshalMap(dataItem)
+	if err != nil {
+		log.Printf("Error marshalling map OnboardVaultMeta %v\n", err)
+		return "", err
+	}
+	writeRequests = append(writeRequests, types.WriteRequest{
+		PutRequest: &types.PutRequest{Item: item},
+	})
+	_, err = cfg_details.DynamoCfg.BatchWriteItem(context.TODO(), &dynamodb.BatchWriteItemInput{
+		RequestItems: map[string][]types.WriteRequest{
+			cfg_details.COLLEGE_METADATA_TABLE: writeRequests,
+		},
+	})
+	if err != nil {
+		log.Printf("Failed to batch write items in OnboardVaultMeta: %v\n", err)
+		return "", err
+	}
+
+	return "", nil
+}
+
+func GetVaultMeta(colId string, course string) (string, error) {
+	key, err := attributevalue.Marshal(cfg_details.GetPk(colId, course))
+	if err != nil {
+		return "", err
+	}
+	sKey, err := attributevalue.Marshal(VAULT_META)
+	if err != nil {
+		log.Printf("Error in GetVaultMeta while marshaling - %v\n", err)
+		return "", err
+	}
+	ck := map[string]types.AttributeValue{
+		"key":  key,
+		"skey": sKey,
+	}
+	out, err := cfg_details.DynamoCfg.GetItem(context.Background(), &dynamodb.GetItemInput{
+		TableName:            aws.String(cfg_details.COLLEGE_METADATA_TABLE),
+		Key:                  ck,
+		ProjectionExpression: aws.String("#val"),
+		ExpressionAttributeNames: map[string]string{
+			"#val": "value",
+		},
+	})
+	if err != nil {
+		log.Printf("Error in fetching data from Dynamo - %v\n", err)
+		return "", err
+	}
+	if out == nil || len(out.Item) == 0 {
+		return "", nil
+	}
+	item := out.Item["value"].(*types.AttributeValueMemberM)
+	log.Println(item)
+	vaultData := item.Value[VAULT_META].(*types.AttributeValueMemberS)
+	if vaultData.Value == "" {
+		return "", nil
+	}
+	return vaultData.Value, nil
+}
+
 func batchWrite(colId string, course string, batch string, cs string, uBy string, s2sData map[string]string) (string, error) {
 	var writeRequests []types.WriteRequest
 	ts := time.Now().Unix()
@@ -134,5 +217,5 @@ func batchWrite(colId string, course string, batch string, cs string, uBy string
 }
 
 func getS2SKeyStr(colId string, course string, batch string, cs string) string {
-	return strings.ToLower(colId) + "_" + strings.ToLower(course) + "_" + strings.ToLower(batch) + "_" + strings.ToLower(cs)
+	return cfg_details.GetPk(strings.ToLower(colId), strings.ToLower(course), strings.ToLower(batch), strings.ToLower(cs))
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cerpApi/cfg_details"
 	"cerpApi/iam"
+	"cerpApi/u_by_service"
 	"context"
 	"encoding/json"
 	"errors"
@@ -23,6 +24,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3Types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
+
+const STUDENTS = "students"
 
 type Student struct {
 	Email                 string `json:"email"`
@@ -76,6 +79,12 @@ type Student struct {
 	FeeReceiptUrl         string `json:"fee_receipt_url"`
 }
 
+type StudentRecord struct {
+	Student   Student `json:"student"`
+	UpdatedBy string  `json:"u_by"`
+	Ts        string  `json:"ts"`
+}
+
 type OnboardStudentBasicData struct {
 	BatchYear          string  `dynamodbav:"pk"`
 	SK                 int     `dynamodbav:"row_num"`
@@ -116,7 +125,7 @@ func OnboardStudent(college string, student *Student, uBy string) (string, error
 	uId := cfg_details.GenerateUserId(getStudentIdKey(college, *student))
 	PKKey := student.Batch + "-" + student.Branch
 	SKKey := getRowNumber(PKKey, college)
-	user := iam.CreateAuth0User(getStudentData(student, uId, college))
+	user := iam.CreateAuth0User(getStudentData(student, uId, college), college)
 	fmt.Println("User created by the id - ", user)
 	student.Id = user
 	if user == "" {
@@ -127,7 +136,7 @@ func OnboardStudent(college string, student *Student, uBy string) (string, error
 	var err error
 	go func() {
 		defer wg.Done()
-		iam.SetUserRoles(user, &err, marshalledRole)
+		iam.SetUserRoles(college, user, &err, marshalledRole)
 		fmt.Println("User roles updated")
 	}()
 	student.Sid = PKKey + "-" + strconv.Itoa(SKKey)
@@ -163,7 +172,7 @@ func persistStudentRecord(college string, student *Student, PKKey string, SKKey 
 		})
 	}
 	if err != nil {
-		fmt.Printf("Student onboard Failed...\n")
+		log.Printf("Student onboard Failed...%v\n", err)
 		return err
 	}
 	fmt.Printf("Updated table and waiting for rolesSet...\n")
@@ -268,7 +277,7 @@ func GetStudentsData(college string, batch string, stream string) []Student {
 	expressionAttributeValues := map[string]types.AttributeValue{
 		":hashKey": &types.AttributeValueMemberS{Value: pk},
 	}
-	cols := aws.String("row_num,#val")
+	cols := aws.String("row_num,#val,#u_by")
 	data, err := cfg_details.DynamoCfg.Query(context.TODO(), &dynamodb.QueryInput{
 		TableName:                 aws.String(college + "_students"),
 		Limit:                     aws.Int32(300),
@@ -276,7 +285,8 @@ func GetStudentsData(college string, batch string, stream string) []Student {
 		ProjectionExpression:      cols,
 		ExpressionAttributeValues: expressionAttributeValues,
 		ExpressionAttributeNames: map[string]string{
-			"#val": "value",
+			"#val":  "value",
+			"#u_by": "u_by",
 		},
 		ScanIndexForward: aws.Bool(true),
 	})
@@ -292,6 +302,63 @@ func GetStudentsData(college string, batch string, stream string) []Student {
 		var student Student
 		err = attributevalue.Unmarshal(items[i]["value"], &student)
 		res[i] = student
+	}
+	return res
+}
+
+func GetStudentsDataV2(college string, batch string, stream string) []StudentRecord {
+	keyConditions := aws.String("pk = :hashKey")
+	pk := batch + "-" + stream
+	expressionAttributeValues := map[string]types.AttributeValue{
+		":hashKey": &types.AttributeValueMemberS{Value: pk},
+	}
+	cols := aws.String("row_num,#val,#u_by,#ts")
+	data, err := cfg_details.DynamoCfg.Query(context.TODO(), &dynamodb.QueryInput{
+		TableName:                 aws.String(college + "_students"),
+		Limit:                     aws.Int32(300),
+		KeyConditionExpression:    keyConditions,
+		ProjectionExpression:      cols,
+		ExpressionAttributeValues: expressionAttributeValues,
+		ExpressionAttributeNames: map[string]string{
+			"#val":  "value",
+			"#u_by": "uBy",
+			"#ts":   "ts",
+		},
+		ScanIndexForward: aws.Bool(true),
+	})
+	if err != nil {
+		fmt.Println(err)
+	}
+	if data.Count == 0 {
+		return make([]StudentRecord, 0)
+	}
+	res := make([]StudentRecord, data.Count)
+	uByMap := make(map[string]string)
+	items := data.Items
+	for i := 0; i < len(items); i++ {
+		var student Student
+		err = attributevalue.Unmarshal(items[i]["value"], &student)
+		if err != nil {
+			log.Printf("Error parsing value for the record %v %v\n", items[i], err)
+		}
+		studentRecord := StudentRecord{
+			Student: student,
+		}
+
+		err = attributevalue.Unmarshal(items[i]["uBy"], &studentRecord.UpdatedBy)
+		if err != nil {
+			log.Printf("Error parsing UpdatedBy for the record %v %v\n", items[i], err)
+		}
+		uByMap[studentRecord.UpdatedBy] = cfg_details.NA
+		err = attributevalue.Unmarshal(items[i]["ts"], &studentRecord.Ts)
+		if err != nil {
+			log.Printf("Error parsing Ts for the record %v %v\n", items[i], err)
+		}
+		res[i] = studentRecord
+	}
+	u_by_service.GetUpdatedBy(college, uByMap)
+	for i := 0; i < len(res); i++ {
+		res[i].UpdatedBy = uByMap[res[i].UpdatedBy]
 	}
 	return res
 }
@@ -465,4 +532,46 @@ func DownloadFile(colId string, sId string, fileKey string) (string, error) {
 
 func getS3Key(colId string, sId string, fName string) string {
 	return colId + "/" + sId + "/" + fName
+}
+
+func GetStudentEmailById(colId string, sId string) (string, error) {
+	pkVal, skVal := extractBatchAndRowNum(sId)
+	cols := aws.String("#val.#Email")
+	data, err := cfg_details.DynamoCfg.Query(context.TODO(), &dynamodb.QueryInput{
+		TableName:              aws.String(colId + "_students"),
+		KeyConditionExpression: aws.String("pk = :pkval AND row_num = :skval"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pkval": &types.AttributeValueMemberS{Value: pkVal},
+			":skval": &types.AttributeValueMemberN{Value: skVal},
+		},
+		ProjectionExpression: cols,
+		ExpressionAttributeNames: map[string]string{
+			"#val":   "value",
+			"#Email": "Email",
+		},
+		ScanIndexForward: aws.Bool(true),
+	})
+	if err != nil {
+		log.Printf("Error while fetching GetStudentEmailById for %s %s %v\n", colId, sId, err)
+		return "", err
+	}
+	if data.Count == 0 {
+		return "", err
+	}
+	items := data.Items
+	if len(items) > 0 {
+		var student Student
+		err = attributevalue.Unmarshal(items[0]["value"], &student)
+		if err != nil {
+			log.Printf("Error while unmarshaling the value in GetStudentEmailById for %s %s %v\n", colId, sId, err)
+			return "", err
+		}
+		return student.Email, nil
+	}
+	return "", nil
+}
+
+func extractBatchAndRowNum(sId string) (string, string) {
+	lastIndOfSep := strings.LastIndex(sId, "-")
+	return sId[:lastIndOfSep], sId[lastIndOfSep+1:]
 }

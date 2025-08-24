@@ -47,8 +47,18 @@ func TestAttendanceReport1(t *testing.T) {
 	fmt.Printf("The output is %v\n", items)
 }
 
+func TestBatchGetItems(t *testing.T) {
+	items, err := batchGetItems("ni", "bca_2024-2027_sem-2_ds-lab-24bca_a")
+	if err != nil {
+		t.Fail()
+		log.Printf("Test case failed for %v\n", err)
+		return
+	}
+	fmt.Printf("The output is %v\n", items)
+}
+
 func TestAttendanceReport2(t *testing.T) {
-	res := GetAttendanceReport("ni", "BCA", "2024-2027_SEM-2", "ENG-24BCA", "A")
+	res := GetAttendanceReport("ni", "BCA", "2024-2027_SEM-2", "DS-LAB-24BCA", "A", "", "")
 	//num := float64(1) / float64(3)
 	//num2 := float32(math.Round(num*10000) / 100)
 	//res1 := num2

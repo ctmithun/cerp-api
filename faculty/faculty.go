@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/url"
 	"strconv"
 	"strings"
@@ -21,23 +22,42 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 var CFG, _ = config.LoadDefaultConfig(context.TODO(), config.WithRegion("ap-south-1"))
 
+var updatedTags = make([]s3types.Tag, 0)
+
 // var CFG, _ = config.LoadDefaultConfig(context.TODO(), config.WithSharedConfigProfile("mumbai"), config.WithRegion("ap-south-1"))
 
+type BankDetails struct {
+	BankName      string `json:"bank_name"`
+	AccountNumber string `json:"acc_no"`
+	IFSC          string `json:"ifsc"`
+}
+
 type Faculty struct {
-	Email       string `json:"email"`
-	Id          string `json:"id"`
-	Name        string `json:"name"`
-	PhoneNumber string `json:"phone_number"`
-	Doj         string `json:"doj"`
-	Subjects    string `json:"subjects"`
-	Description string `json:"description"`
-	Type        string `json:"type"`
-	Roles       string `json:"roles"`
-	Designation string `json:"designation"`
+	Email                  string      `json:"email"`
+	Id                     string      `json:"id"`
+	Name                   string      `json:"name"`
+	PhoneNumber            string      `json:"phone_number"`
+	Doj                    string      `json:"doj"`
+	Subjects               string      `json:"subjects"`
+	Description            string      `json:"description"`
+	Type                   string      `json:"type"`
+	Roles                  string      `json:"roles"`
+	Designation            string      `json:"designation"`
+	Department             string      `json:"department"`
+	EmergencyContactNumber string      `json:"ecn"`
+	BloodGroup             string      `json:"blood_group"`
+	Address                string      `json:"address"`
+	BankDetails            BankDetails `json:"bank_details"`
+	Photo                  string      `json:"photo"`
+	EmpNo                  string      `json:"emp_no"`
+	AadharNumber           string      `json:"aadhar_number"`
+	Qualification          string      `json:"qualification"`
 }
 
 type OnboardFacultyMetadata struct {
@@ -48,9 +68,9 @@ type OnboardFacultyMetadata struct {
 	Updater string  `dynamodbav:"uBy"`
 }
 
-func CreateFacultyMeta(college string, facultyData Faculty, uBy string) (bool, string) {
+func CreateFacultyMeta(con *pgxpool.Pool, college string, facultyData Faculty, uBy string) (bool, string) {
 	uId := cfg_details.GenerateUserId(getFacultyIdKey(college, facultyData))
-	user := iam.CreateAuth0User(mapFacultyData(facultyData, uId, college))
+	user := iam.CreateAuth0User(mapFacultyData(facultyData, uId, college), college)
 	fmt.Println("User created by the id - ", user)
 	if user == "" {
 		return false, uId
@@ -66,9 +86,11 @@ func CreateFacultyMeta(college string, facultyData Faculty, uBy string) (bool, s
 			fmt.Printf("Error Marshaling the allRoles - %v", err)
 			return
 		}
-		iam.SetUserRoles(user, &err, marshaledRoleTmp)
+		iam.SetUserRoles(college, user, &err, marshaledRoleTmp)
 		fmt.Println("User roles updated")
 	}()
+	facultyData.EmpNo = setEmpNo(con, college, user, facultyData.Doj)
+	facultyData.Id = user
 	ok, err := updateFacultyData(college, facultyData, user, uBy)
 	if !ok {
 		return false, uId
@@ -79,6 +101,30 @@ func CreateFacultyMeta(college string, facultyData Faculty, uBy string) (bool, s
 		return false, uId
 	}
 	return true, uId
+}
+
+func UpdateProfileTag(s3Client *s3.Client, colId string, photo string) error {
+	return updateS3Tag(s3Client, colId, photo, updatedTags)
+}
+
+func updateExpireTag(s3Client *s3.Client, colId string, photo string) error {
+	return updateS3Tag(s3Client, colId, photo, cfg_details.ExpireS3Tag())
+}
+
+func updateS3Tag(s3Client *s3.Client, colId string, photo string, tags []s3types.Tag) error {
+	ctx, cancel := cfg_details.GetTimeoutContext()
+	defer cancel()
+	_, err := s3Client.PutObjectTagging(ctx, &s3.PutObjectTaggingInput{
+		Bucket: aws.String(cfg_details.BUCKET_STUDENTS_FACULTIES),
+		Key:    aws.String(getS3Key(colId, "faculty/profilepics", photo)),
+		Tagging: &s3types.Tagging{
+			TagSet: tags,
+		},
+	})
+	if err != nil {
+		log.Printf("Failed to update tags %v\n", err)
+	}
+	return err
 }
 
 func getRoles(roles []string) map[string][]string {
@@ -97,9 +143,18 @@ func getRoles(roles []string) map[string][]string {
 	return allRoles
 }
 
+func getLatestPhoto(photo string) string {
+	photos := strings.Split(photo, "::")
+	if len(photos) > 1 {
+		return photos[1]
+	}
+	return photo
+}
+
 func updateFacultyData(college string, facultyData Faculty, user string, uBy string) (bool, error) {
 	PKKey := user
 	SKKey := facultyData.Email
+	facultyData.Photo = getLatestPhoto(facultyData.Photo)
 	onF := OnboardFacultyMetadata{
 		PK:      PKKey,
 		SK:      SKKey,
@@ -118,7 +173,8 @@ func updateFacultyData(college string, facultyData Faculty, user string, uBy str
 		return false, err
 	}
 	facultyBasicData := Faculty{
-		Name: facultyData.Name,
+		Name:  facultyData.Name,
+		EmpNo: facultyData.EmpNo,
 	}
 	allFacultyData := OnboardFacultyMetadata{
 		PK:    college + "_faculty",
@@ -185,10 +241,10 @@ func GetFacultyAssignedSubjects(colId string, userId string) string {
 	return fmt.Sprintf("%s", res["Subjects"])
 }
 
-func GetFacultiesData(college string, facultyId string) string {
+func getFacultiesData(colId string, facultyId string) []Faculty {
 	keyConditions := aws.String("#pk = :hashKey")
 	expressionAttributeValues := map[string]types.AttributeValue{
-		":hashKey": &types.AttributeValueMemberS{Value: college + "_faculty"},
+		":hashKey": &types.AttributeValueMemberS{Value: colId + "_faculty"},
 	}
 	expressionAttributeNames := map[string]string{
 		"#pk":  "key",
@@ -200,7 +256,7 @@ func GetFacultiesData(college string, facultyId string) string {
 	}
 	cols := aws.String("email,#val")
 	data, err := cfg_details.DynamoCfg.Query(context.TODO(), &dynamodb.QueryInput{
-		TableName:                 aws.String(college + "_faculty"),
+		TableName:                 aws.String(colId + "_faculty"),
 		Limit:                     aws.Int32(50),
 		KeyConditionExpression:    keyConditions,
 		ProjectionExpression:      cols,
@@ -209,7 +265,8 @@ func GetFacultiesData(college string, facultyId string) string {
 		ScanIndexForward:          aws.Bool(false),
 	})
 	if err != nil {
-		fmt.Println(err)
+		log.Println(err)
+		return nil
 	}
 	res := make([]Faculty, len(data.Items))
 	for i := 0; i < len(data.Items); i++ {
@@ -226,6 +283,14 @@ func GetFacultiesData(college string, facultyId string) string {
 			res[i] = item
 		}
 	}
+	return res
+}
+
+func GetFacultiesData(college string, facultyId string) string {
+	res := getFacultiesData(college, facultyId)
+	if res == nil {
+		return ""
+	}
 	finalRes, err := json.Marshal(res)
 	if err != nil {
 		return ""
@@ -233,25 +298,96 @@ func GetFacultiesData(college string, facultyId string) string {
 	return string(finalRes)
 }
 
-func ModifyFacultyData(college string, facultyForm Faculty, uBy string, isRoleUpdate bool) (bool, string) {
+func ModifyFacultyData(con *pgxpool.Pool, s3Client *s3.Client, college string, facultyForm Faculty, uBy string, isRoleUpdate bool) (bool, string) {
 	user := cfg_details.GenerateUserId(getFacultyIdKey(college, facultyForm))
 	if !strings.Contains(facultyForm.Id, user) {
 		return false, cfg_details.INVALID_DATA
 	}
+	empNo := getEmpNo(con, college, facultyForm.Id)
+	if empNo == "" {
+		log.Printf("Employee No not found for %s\n", facultyForm.Id)
+		return false, "EmpNo not found"
+	}
+	facultyForm.EmpNo = empNo
 	_, err := updateFacultyData(college, facultyForm, facultyForm.Id, uBy)
+	updatePhotosTag(s3Client, college, &facultyForm)
 	if isRoleUpdate {
-		marshaledRoleTmp, err := json.Marshal(getRoles(strings.Split(facultyForm.Roles, ",")))
+		curRolesMap := iam.GetUserRoles(college, facultyForm.Id, &err)
+		newRolesMap := getRoles(strings.Split(facultyForm.Roles, ","))
+		newRoles := newRolesMap["roles"]
+		for i := 0; i < len(newRoles); i++ {
+			delete(curRolesMap, newRoles[i])
+		}
+		marshaledRoleTmp, err := json.Marshal(newRolesMap)
 		if err != nil {
-			fmt.Printf("Error Marshaling the allRoles - %v", err)
+			fmt.Printf("Error Marshaling the newRoles - %v", err)
 			return false, cfg_details.CODE_ERROR + err.Error()
 		}
-		iam.SetUserRoles(facultyForm.Id, &err, marshaledRoleTmp)
+		iam.SetUserRoles(college, facultyForm.Id, &err, marshaledRoleTmp)
+		if len(curRolesMap) > 0 {
+			var delRolesList []string
+			for k := range curRolesMap {
+				delRolesList = append(delRolesList, k)
+			}
+			reqBodyMap := make(map[string][]string)
+			reqBodyMap["roles"] = delRolesList
+			marshaledCurRoles, err := json.Marshal(reqBodyMap)
+			if err != nil {
+				fmt.Printf("Error Marshaling the curRoles - %v", err)
+				return false, cfg_details.CODE_ERROR + err.Error()
+			}
+			iam.DeleteUserRoles(college, facultyForm.Id, &err, marshaledCurRoles)
+		}
 	}
 	if err != nil {
 		fmt.Println("Failed updating on the user - ", user)
 		return false, facultyForm.Email
 	}
 	return true, facultyForm.Email
+}
+
+func ProfileUpdate(con *pgxpool.Pool, s3Client *s3.Client, colId string, facultyForm Faculty, uBy string) (bool, string) {
+	facultyFormArr := getFacultiesData(colId, uBy)
+	if len(facultyFormArr) == 0 {
+		return false, "Unavailable"
+	}
+	facultyFormCurrent := facultyFormArr[0]
+	facultyForm.Id = uBy
+	user := cfg_details.GenerateUserId(getFacultyIdKey(colId, facultyFormCurrent))
+	if !strings.Contains(facultyForm.Id, user) {
+		return false, cfg_details.INVALID_DATA
+	}
+	facultyFormCurrent.Address = facultyForm.Address
+	facultyFormCurrent.Name = facultyForm.Name
+	facultyFormCurrent.Description = facultyForm.Description
+	facultyFormCurrent.Name = facultyForm.Name
+	facultyFormCurrent.EmergencyContactNumber = facultyForm.EmergencyContactNumber
+	facultyFormCurrent.Qualification = facultyForm.Qualification
+	facultyFormCurrent.BloodGroup = facultyForm.BloodGroup
+	facultyFormCurrent.BankDetails.AccountNumber = facultyForm.BankDetails.AccountNumber
+	facultyFormCurrent.BankDetails.IFSC = facultyForm.BankDetails.IFSC
+	facultyFormCurrent.BankDetails.BankName = facultyForm.BankDetails.BankName
+	facultyFormCurrent.Photo = facultyForm.Photo
+	facultyFormCurrent.AadharNumber = facultyForm.AadharNumber
+	_, err := updateFacultyData(colId, facultyFormCurrent, uBy, uBy)
+	updatePhotosTag(s3Client, colId, &facultyFormCurrent)
+	if err != nil {
+		log.Println("Failed updating on the user - ", user)
+		return false, facultyFormCurrent.Email
+	}
+	return true, facultyFormCurrent.Email
+}
+
+func updatePhotosTag(s3Client *s3.Client, colId string, faculty *Faculty) {
+	photos := strings.Split(faculty.Photo, "::")
+	if len(photos) > 1 {
+		if photos[0] != "" {
+			updateExpireTag(s3Client, colId, photos[0])
+		}
+		UpdateProfileTag(s3Client, colId, photos[1])
+		log.Printf("Uploaded the new photo %s\n", photos[1])
+		faculty.Photo = photos[1]
+	}
 }
 
 //func UploadFacultyFiles()
@@ -261,33 +397,22 @@ func DeactivateFaculty(college string, facultyForm Faculty, uBy string) (bool, s
 	if !strings.Contains(facultyForm.Id, user) {
 		return false, cfg_details.INVALID_DATA
 	}
-	err := iam.DeactivateUser(facultyForm.Id, uBy)
+	err := iam.DeactivateUser(college, facultyForm.Id, uBy)
 	if err != nil {
 		return false, err.Error()
 	}
 	return true, ""
 }
 
-func DeleteFaculty(college string, facultyForm Faculty, uBy string) (bool, string) {
+func DeleteFaculty(s3Client *s3.Client, college string, facultyForm Faculty, uBy string) (bool, string) {
 	user := cfg_details.GenerateUserId(getFacultyIdKey(college, facultyForm))
 	if !strings.Contains(facultyForm.Id, user) {
 		return false, cfg_details.INVALID_DATA
 	}
-	err := iam.DeleteUser(facultyForm.Id, uBy)
+	err := iam.DeactivateUser(college, facultyForm.Id, uBy)
 	if err != nil {
 		return false, err.Error()
 	}
-	// item, err := cfg_details.DynamoCfg.DeleteItem(context.TODO(), &dynamodb.DeleteItemInput{
-	// 	TableName: aws.String(college + "_faculty"),
-	// 	Key: map[string]types.AttributeValue{
-	// 		"key":   &types.AttributeValueMemberS{Value: facultyForm.Id},
-	// 		"email": &types.AttributeValueMemberS{Value: facultyForm.Email},
-	// 	},
-	// })
-	// if err != nil || item == nil {
-	// 	fmt.Println("Error in deactivating faculty from the table - ", facultyForm.Id)
-	// 	return false, ""
-	// }
 	item, err := cfg_details.DynamoCfg.DeleteItem(context.TODO(), &dynamodb.DeleteItemInput{
 		TableName: aws.String(college + "_faculty"),
 		Key: map[string]types.AttributeValue{
@@ -295,6 +420,7 @@ func DeleteFaculty(college string, facultyForm Faculty, uBy string) (bool, strin
 			"email": &types.AttributeValueMemberS{Value: facultyForm.Id},
 		},
 	})
+	updateExpireTag(s3Client, college, facultyForm.Photo)
 	if err != nil || item == nil {
 		fmt.Printf("Error in deactivating faculty from the table for %s_faculty partition key - %s\n", college, facultyForm.Id)
 		return false, ""
@@ -317,7 +443,8 @@ func DeleteFacultyFile(s3Client *s3.Client, colId string, fId string, fileKey st
 	setVal = setVal + " ts = :ts, uBy = :uBy"
 	expr[":ts"] = &types.AttributeValueMemberN{Value: fmt.Sprint(time.Now().Unix())}
 	expr[":uBy"] = &types.AttributeValueMemberS{Value: uBy}
-	aliasFileKey := strings.ReplaceAll(fileKey, ".", "")
+	// aliasFileKey := strings.ReplaceAll(fileKey, ".", "")
+	aliasFileKey := "f" + strconv.Itoa(rand.Intn(900)+100)
 	exprNames := map[string]string{
 		"#fil":             "values",
 		"#" + aliasFileKey: fileKey,
@@ -352,14 +479,17 @@ func UpdateFileMeta(colId string, formMap map[string]string, fId string, uBy str
 	exprNames := map[string]string{
 		"#fil": "values",
 	}
+	i := 0
 	for k, v := range formMap {
 		if setVal != "SET" {
 			setVal = setVal + ","
 		}
-		aliasKey := strings.ReplaceAll(k, ".", "")
-		setVal = setVal + " #fil.#" + aliasKey + " = :" + aliasKey
-		expr[":"+aliasKey] = &types.AttributeValueMemberS{Value: v}
-		exprNames["#"+aliasKey] = k
+		// aliasKey := strings.ReplaceAll(k, ".", "")
+		fKey := "f" + strconv.Itoa(i)
+		setVal = setVal + " #fil.#" + fKey + " = :" + fKey
+		expr[":"+fKey] = &types.AttributeValueMemberS{Value: v}
+		exprNames["#"+fKey] = k
+		i = i + 1
 	}
 	setVal = setVal + ", ts = :ts, uBy = :uBy"
 	expr[":ts"] = &types.AttributeValueMemberN{Value: fmt.Sprint(time.Now().Unix())}
@@ -495,4 +625,114 @@ func FetchFilesMetadata(colId string, uId string) (map[string]string, error) {
 		return nil, err
 	}
 	return res, nil
+}
+
+func UploadImage(s3Client *s3.Client, colId string, imageData []byte, mimeType string) (string, error) {
+	uniqueKey := cfg_details.GenerateUUID() + "." + strings.Split(mimeType, "/")[1]
+	key := getS3Key(colId, "faculty/profilepics", uniqueKey)
+	ctx, cancel := cfg_details.GetTimeoutContext()
+	defer cancel()
+	_, err := s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(cfg_details.BUCKET_STUDENTS_FACULTIES),
+		Key:         aws.String(key),
+		Tagging:     aws.String(tags),
+		Body:        bytes.NewReader(imageData),
+		ContentType: aws.String(mimeType),
+	})
+	if err != nil {
+		log.Printf("Error in UploadImage %v\n", err)
+		return "", err
+	}
+	return uniqueKey, nil
+}
+
+func GetProfilePic(colId string, imageKey string) (string, error) {
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(cfg_details.BUCKET_STUDENTS_FACULTIES),
+		Key:    aws.String(getS3Key(colId, "faculty/profilepics", imageKey)),
+	}
+	ctx, cancel := cfg_details.GetTimeoutContext()
+	defer cancel()
+	presignedURL, err := cfg_details.Presigner.PresignGetObject(ctx, input, s3.WithPresignExpires(5*time.Minute))
+	if err != nil {
+		log.Printf("Error in dowloading the requested faculty profilepic for s3 read operation - %s error-%v\n", imageKey, err)
+		return "", err
+	}
+	enc := url.QueryEscape(presignedURL.URL)
+	body, _ := json.Marshal(cfg_details.FileResponse{URL: enc})
+	return string(body), err
+}
+
+func getS3Key(colId string, path string, fName string) string {
+	return colId + "/" + path + "/" + fName
+}
+
+func getEmpNo(con *pgxpool.Pool, colId string, facultyId string) string {
+	facultyTable := getFacultyTable(colId)
+	query := `SELECT emp_no FROM ` + facultyTable + ` WHERE id = '` + facultyId + `' order by ts desc limit 1;`
+	ctx, cancel := cfg_details.GetTimeoutContext()
+	defer cancel()
+	row, err := con.Query(ctx, query)
+	if err != nil {
+		log.Printf("Error in querying the faculty table for getEmpNo %v\n", err)
+		return ""
+	}
+	defer row.Close()
+	var empNo string
+	for row.Next() {
+		err = row.Scan(&empNo)
+		if err != nil {
+			log.Println("Error querying the Faculty table for fetching - Scan - " + err.Error())
+		}
+	}
+	return empNo
+}
+
+func getInsertFacultyFn(colId string) string {
+	return "students." + colId + "_insert_faculty"
+}
+
+func setEmpNo(con *pgxpool.Pool, colId string, facultyId string, doj string) string {
+	log.Printf("Setting Employee for %s-%s\n", facultyId, colId)
+	facultyInsertFn := getInsertFacultyFn(colId)
+	query := `
+		Select ` + facultyInsertFn + `(@id, @doj);
+	`
+	args := pgx.NamedArgs{
+		"id":  facultyId,
+		"doj": doj,
+	}
+	ctx, cancel := cfg_details.GetTimeoutContext()
+	defer cancel()
+	tx, err := con.Begin(ctx)
+	if err != nil {
+		return ""
+	}
+
+	defer func() {
+		if err != nil {
+			tx.Rollback(ctx)
+		} else {
+			tx.Commit(ctx)
+		}
+	}()
+	row, err := con.Query(ctx, query, args)
+	if err != nil {
+		log.Printf("Error while generating employee number for faculty-%s %v\n", facultyId, err)
+		return ""
+	}
+	defer row.Close()
+	var empNo string
+	for row.Next() {
+		err = row.Scan(&empNo)
+		if err != nil {
+			log.Printf("Error querying the Faculty table for fetching - Scan - %s %v\n", facultyId, err.Error())
+		}
+	}
+	log.Printf("Employee Number generated %s - %s\n", facultyId, empNo)
+	return empNo
+}
+
+func getFacultyTable(colId string) string {
+	return "students." + colId + "_faculty_v2"
 }

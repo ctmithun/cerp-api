@@ -77,9 +77,11 @@ func GetEnqV2(con *pgxpool.Pool, ctx context.Context, id int64, colId string) (F
 	var pR FormData
 	for rows.Next() {
 		var ts time.Time
+		var doe time.Time
 		err := rows.Scan(&pR.Id, &pR.Name, &pR.Course, &pR.Location, &pR.CouncillorId, &pR.CouncillorName, &pR.Mobile, &pR.Reference,
-			&pR.Status, &pR.UpdatedBy, &ts, &pR.Batch, &pR.PrevQual, &pR.ParentMobile, &pR.Doe)
+			&pR.Status, &pR.UpdatedBy, &ts, &pR.Batch, &pR.PrevQual, &pR.ParentMobile, &doe)
 		pR.Ts = ts.Format("2006-01-02 15:04:05")
+		pR.Doe = doe.Format("2006-01-02")
 		if err != nil {
 			fmt.Println("Error querying the Eq table for fetching - " + err.Error())
 			continue

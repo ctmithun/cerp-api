@@ -4,8 +4,9 @@ import (
 	"cerpApi/cfg_details"
 	"context"
 	"encoding/json"
-	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"log"
+
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 )
 
 var Q_URL = "https://sqs.ap-south-1.amazonaws.com/214672925111/attendance"
@@ -18,6 +19,19 @@ type AbsentNotificationWrapper struct {
 	Subject       string        `json:"class"`
 }
 
+type OtpType struct {
+	OtpType string `json:"otp_type"`
+	Ts      string `json:"ts"`
+	Otp     string `json:"otp"`
+}
+
+type StudentOtpWrapper struct {
+	Sid     string  `json:"sid"`
+	Type    OtpType `json:"otp_type"`
+	Content string  `json:"content"`
+	Email   string  `json:"email"`
+}
+
 func NotifyUsers(mes AbsentNotificationWrapper, channel string) {
 	switch channel {
 	case "Q":
@@ -27,17 +41,38 @@ func NotifyUsers(mes AbsentNotificationWrapper, channel string) {
 		} else {
 			addQMes(string(jsonStr))
 		}
-		break
 	}
 }
 
-func addQMes(mes string) {
-	log.Printf("In Absent notification System - addQMes...")
+func SendOtp(sId string, purpose string, ts string, content string, email string, otp string) error {
+	otpType := OtpType{
+		OtpType: purpose,
+		Ts:      ts,
+		Otp:     otp,
+	}
+	studentOtpWrap := StudentOtpWrapper{
+		Sid:     sId,
+		Type:    otpType,
+		Content: content,
+		Email:   email,
+	}
+	studentOtpWrapJsonStr, err := json.Marshal(studentOtpWrap)
+	if err != nil {
+		log.Printf("Error while sending the otp for the student - %s", sId)
+		return err
+	}
+	return addQMes(string(studentOtpWrapJsonStr))
+}
+
+func addQMes(mes string) error {
+	log.Printf("In notification System - addQMes...")
 	_, err := cfg_details.SqsClient.SendMessage(context.TODO(), &sqs.SendMessageInput{
 		QueueUrl:    &Q_URL,
 		MessageBody: &mes,
 	})
 	if err != nil {
 		log.Printf("Error sending message: %v\n", err)
+		return err
 	}
+	return nil
 }

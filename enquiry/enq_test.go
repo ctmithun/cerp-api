@@ -90,7 +90,7 @@ func TestDeactivateEnquiryBestCase(t *testing.T) {
 }
 
 func TestGetActiveEnquiry(t *testing.T) {
-	_, err := GetActiveEnquiry("ni", "01JJ9NTDC0BPBX22AMZVQT7750")
+	_, err := GetActiveEnquiry("ni", "1069677624646598657")
 	if err != nil {
 		fmt.Println(err.Error())
 		t.Fail()
@@ -106,7 +106,7 @@ func TestGetEnqV2(t *testing.T) {
 			err = fmt.Errorf("unable to create connection pool: %w", err)
 			return
 		}
-		res, err := GetEnqV2(db, ctx, 1053340366668365825, "ni")
+		res, err := GetEnqV2(db, ctx, 1069677624646598657, "ni")
 		db.Close()
 		if err != nil {
 			fmt.Println(err.Error())

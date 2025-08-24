@@ -47,6 +47,8 @@ var isTest = false
 
 const Attendance_Date_Format = "2-1-2006"
 
+const Attendance_Date_Format2 = "2006-01-02" // yyyy-mm-dd
+
 func GetAttendanceForm(college string, course string, batch string, sub string, date string, cs string) (AttendanceForm, error) {
 	key, err := getAttendanceKey(course, batch, sub, cs)
 	sKey, err := attributevalue.Marshal(date)
@@ -210,7 +212,7 @@ func batchGetItems(colId string, key string) ([]Item, error) {
 	return items, err
 }
 
-func GetAttendanceReport(college string, course string, batch string, sub string, cs string) string {
+func GetAttendanceReport(college string, course string, batch string, sub string, cs string, fromDate string, toDate string) string {
 	studData, err := students.GetStudents(college, course, batch, cs)
 	if err != nil {
 		log.Printf("Error in GetAttendance Report while fetching the students master data - %v\n", err)
@@ -218,8 +220,16 @@ func GetAttendanceReport(college string, course string, batch string, sub string
 	}
 	var res string
 	err = attributevalue.Unmarshal(studData, &res)
+	if err != nil {
+		log.Printf("Error in unmarshaling the student data %v\n", err)
+		return ""
+	}
 	var parsedRes []Student
 	err = json.Unmarshal([]byte(res), &parsedRes)
+	if err != nil {
+		log.Printf("Error in unmarshaling the student data %v\n", err)
+		return ""
+	}
 	studMap := make(map[string]Student)
 	for _, val := range parsedRes {
 		studMap[val.Id] = val
@@ -235,7 +245,7 @@ func GetAttendanceReport(college string, course string, batch string, sub string
 	for _, item := range items {
 		dates = append(dates, item.Date)
 		datesToAttendanceMap[item.Date] = item
-		t, err := time.Parse(Attendance_Date_Format, item.Date)
+		t, err := cfg_details.DetectAndParseDate(item.Date)
 		if err != nil {
 			log.Printf("Error Parsing date %v\n", err)
 			return ""
@@ -246,9 +256,11 @@ func GetAttendanceReport(college string, course string, batch string, sub string
 		return parsedDates[i].Before(parsedDates[j])
 	})
 	for i := 0; i < len(parsedDates); i++ {
-		dates[i] = parsedDates[i].Format(Attendance_Date_Format)
+		dates[i] = parsedDates[i].Format(formatDateBasedOnCutoff(parsedDates[i]))
+		log.Printf("The date is %s\n", dates[i])
 	}
-	attendanceRecords := generateReport(dates, studMap, datesToAttendanceMap)
+	log.Printf("The dates are %v\n", datesToAttendanceMap)
+	attendanceRecords := generateReport(dates, studMap, datesToAttendanceMap, fromDate, toDate)
 	if attendanceRecords != nil {
 		res, err := json.Marshal(AttendancePerClass{
 			AttendanceReports: attendanceRecords,
@@ -260,6 +272,15 @@ func GetAttendanceReport(college string, course string, batch string, sub string
 		return string(res)
 	}
 	return ""
+}
+
+var cutoff = time.Date(2025, time.August, 10, 0, 0, 0, 0, time.UTC)
+
+func formatDateBasedOnCutoff(date time.Time) string {
+	if date.Before(cutoff) {
+		return Attendance_Date_Format // d-m-yyyy
+	}
+	return Attendance_Date_Format2 // yyyy-mm-dd
 }
 
 type StudentAttendanceRecord struct {
@@ -288,10 +309,27 @@ type AttendancePerClass struct {
 	Key               string             `json:"key"`
 }
 
-func generateReport(dates []string, studMap map[string]Student, dateVsItemsMap map[string]Item) []AttendanceReport {
+func generateReport(dates []string, studMap map[string]Student, dateVsItemsMap map[string]Item, fromDateStr string, toDateStr string) []AttendanceReport {
 	res := make([]AttendanceReport, 0)
 	studentsAttendanceRecords := make(map[string][]StudentAttendanceReport)
-	for ind, date := range dates {
+	layout := "2006-01-02" // YYYY-MM-DD
+	var fromDate time.Time
+	var toDate time.Time
+	var err error
+	if fromDateStr != "" && toDateStr != "" {
+		fromDate, err = time.Parse(layout, fromDateStr)
+		if err != nil {
+			log.Printf("Error parsing from date %s - %v\n", fromDateStr, err)
+			return nil
+		}
+		toDate, err = time.Parse(layout, toDateStr)
+		if err != nil {
+			log.Printf("Error parsing to date %s - %v\n", toDateStr, err)
+			return nil
+		}
+	}
+	rangeIndex := -1
+	for _, date := range dates {
 		attendanceReport := AttendanceReport{
 			Date:     date,
 			TimeSlot: "",
@@ -299,6 +337,14 @@ func generateReport(dates []string, studMap map[string]Student, dateVsItemsMap m
 			Students: nil,
 		}
 		studentsAttendees := make(map[string]bool)
+		attendanceDate, err := cfg_details.DetectAndParseDate(date)
+		if err != nil {
+			log.Printf("Error parsing attendanceDate %s - %v\n", date, err)
+			return nil
+		}
+		if !fromDate.IsZero() && !toDate.IsZero() && !cfg_details.IsDateInRange(attendanceDate, fromDate, toDate) {
+			continue
+		}
 		val, exist := dateVsItemsMap[date]
 		if exist {
 			var studentRecord AttendanceForm
@@ -313,6 +359,7 @@ func generateReport(dates []string, studMap map[string]Student, dateVsItemsMap m
 			attendanceReport.TimeSlot = studentRecord.TimeSlot
 			attendanceReport.WorkLog = studentRecord.WorkLog
 		}
+		rangeIndex++
 		attendanceReport.Students = make([]StudentAttendanceReport, 0)
 		for id, stud := range studMap {
 			_, isPresent := studentsAttendees[id]
@@ -324,7 +371,7 @@ func generateReport(dates []string, studMap map[string]Student, dateVsItemsMap m
 			}
 			studReport := StudentAttendanceReport{
 				AttendanceRecords: studData,
-				TotalDays:         int16(ind + 1),
+				TotalDays:         int16(rangeIndex + 1),
 				PresentDays:       0,
 				Percentage:        0,
 			}
