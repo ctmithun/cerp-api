@@ -243,6 +243,7 @@ func GenerateOtp(colId string, studentDocs StudentDocs, uBy string) error {
 		return err
 	}
 	hashStr, err := generateHash(b)
+	log.Printf("Generating OTP for the student hash - %s %s by %s\n", hashStr, studentDocs.Sid, uBy)
 	if err != nil {
 		return err
 	}
@@ -278,7 +279,7 @@ func insertToDb(colId string, sId string, content string, hashVal string, otpStr
 	// 	return err
 	// }
 	ttl := cfg_details.GenerateTtl(10)
-	otp.PersistOtp(colId, sId, hashVal, content, otpStr, OTP_TYPE, ttl)
+	otp.PersistOtp(colId, sId, content, hashVal, otpStr, OTP_TYPE, ttl)
 	email, err := GetStudentEmailById(colId, sId)
 	if err != nil {
 		return err
